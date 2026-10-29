@@ -14,6 +14,7 @@
 #include <string>
 #include <wctype.h>
 #include <locale.h>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // 配色
@@ -49,16 +50,30 @@ static const COLORREF C_ST_CANC_FG = RGB(150, 68, 68);
 // ---------------------------------------------------------------------------
 enum CtlId
 {
-    ID_START = 1000, ID_STOP, ID_SYNC, ID_FILL, ID_EDIT_START, ID_LOG,
-    ID_PICK0 = 1010, ID_PICK1, ID_PICK2,
-    ID_PLAY0 = 1020, ID_PLAY1, ID_PLAY2
+    ID_START = 1000, ID_STOP, ID_SYNC, ID_FILL, ID_EDIT_NAME, ID_LOG,
+    ID_EXAM_LIST, ID_ADD_EXAM, ID_DEL_EXAM, ID_CLEAR_EXAM, ID_NOW30, ID_DTP,
+    ID_PICK0 = 1030, ID_PICK1, ID_PICK2,
+    ID_PLAY0 = 1040, ID_PLAY1, ID_PLAY2
 };
 
 #define WM_SYNC_DONE (WM_APP + 10)
 #define TIMER_TICK   1
 
+#define MAX_EXAMS    24
+#define NODE_COUNT   3
+
 enum NodeState { ST_NONE = 0, ST_PEND, ST_PLAY, ST_DONE, ST_MISS, ST_CANC };
 enum BtnKind   { BTN_TOOL = 0, BTN_PRIMARY, BTN_DANGER };
+
+// 三个打铃节点相对考试开始时间的偏移（分钟）
+static const int kNodeOffsetMin[NODE_COUNT] = { -10, -5, 0 };
+static const wchar_t* kNodeName[NODE_COUNT] =
+{
+    L"考前 10 分钟 · 考生进入考场",
+    L"考前 5 分钟 · 下发试卷与答题卡",
+    L"考试开始 · 考生开始作答"
+};
+static const wchar_t* kNodeShort[NODE_COUNT] = { L"考前 10 分钟", L"考前 5 分钟", L"考试开始" };
 
 struct BtnInfo
 {
@@ -76,11 +91,13 @@ static HWND g_hwnd = NULL;
 
 static HWND hTitle = NULL, hSubtitle = NULL, hClock = NULL, hDate = NULL;
 static HWND hSync = NULL, hCountdown = NULL, hBtnSync = NULL;
-static HWND hGrpSet = NULL, hLblSetCap = NULL, hEditStart = NULL, hBtnFill = NULL, hHint = NULL;
-static HWND hGrpNode = NULL, hNodeName[3] = {0}, hNodeTime[3] = {0}, hNodeState[3] = {0};
+static HWND hGrpSet = NULL, hEditName = NULL, hDtp = NULL, hBtnAdd = NULL, hBtnDel = NULL;
+static HWND hBtnClear = NULL, hBtnNow = NULL, hExamCount = NULL, hSetHint = NULL;
+static HWND hExamList = NULL, hListHint = NULL;
+static HWND hGrpNode = NULL, hNodeTitle = NULL, hNodeName[3] = {0}, hNodeTime[3] = {0}, hNodeState[3] = {0};
 static HWND hGrpAudio = NULL, hAudioCap[3] = {0}, hAudioFile[3] = {0}, hBtnPick[3] = {0}, hBtnPlay[3] = {0};
 static HWND hGrpLog = NULL, hLog = NULL;
-static HWND hBtnStart = NULL, hBtnStop = NULL;
+static HWND hBtnStart = NULL, hBtnStop = NULL, hFootHint = NULL;
 
 static BtnInfo biTool, biPrimary, biDanger;
 
@@ -97,25 +114,34 @@ static bool      g_syncBusy = false;
 static __int64   g_lastOffsetMs = 0;
 static ULONGLONG g_lastSyncTick = 0;
 
-// 节点
-static __int64      g_nodeFt[3] = {0, 0, 0};
-static int          g_nodeState[3] = {ST_NONE, ST_NONE, ST_NONE};
+// 考试场次（每场固定三个打铃节点）
+struct Exam
+{
+    std::wstring name;
+    __int64      startFt;
+    __int64      nodeFt[NODE_COUNT];
+    int          nodeState[NODE_COUNT];
+};
+
+static Exam         g_exam[MAX_EXAMS];
+static int          g_examCount = 0;
+static int          g_selectedExam = -1;
 static std::wstring g_audio[3];
 
 // 运行状态
 static bool g_running = false;
 static bool g_stoppedByUser = false;
-static int  g_playingIndex = -1;
+static int  g_playExam = -1;
+static int  g_playKind = -1;
 
 // 待启动（校时完成后才真正开始）
-static bool    g_pendingStart = false;
-static __int64 g_pendingStartFt = 0;
+static bool g_pendingStart = false;
 
 // MCI
 static bool g_mciOpen = false;
 
 // 刷子
-static HBRUSH bBg, bSurface, bLine, bEdit;
+static HBRUSH bBg, bSurface, bLine, bEdit, bSel, bSelHover;
 static HBRUSH bStatePend, bStatePlay, bStateDone, bStateMiss, bStateCanc, bDisabledBg;
 
 // ---------------------------------------------------------------------------
@@ -207,6 +233,15 @@ static std::wstring FormatDateTime(__int64 ticks)
     return buf;
 }
 
+// 界面中展示的"短日期 + 时分"，例如 10-30 09:00
+static std::wstring FormatMonthDayHm(__int64 ticks)
+{
+    SYSTEMTIME st = FtToSystemTime(ticks);
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%02d-%02d %02d:%02d", st.wMonth, st.wDay, st.wHour, st.wMinute);
+    return buf;
+}
+
 static std::wstring FormatDate(__int64 ticks)
 {
     SYSTEMTIME st = FtToSystemTime(ticks);
@@ -224,9 +259,8 @@ static std::wstring FormatDate(__int64 ticks)
 
 static std::wstring NodeName(int index)
 {
-    wchar_t buf[160];
-    GetWindowTextW(hNodeName[index], buf, 160);
-    return buf;
+    if (index < 0 || index >= NODE_COUNT) return L"";
+    return kNodeShort[index];
 }
 
 static std::wstring FileNameOf(const std::wstring& path)
@@ -277,10 +311,28 @@ static std::wstring Trim(const std::wstring& s)
 static void SaveSettings()
 {
     std::wstring text = L"# 考试自动打铃 配置文件\r\n";
+    text += L"# examCount 为场次数量，examN_name / examN_time 依次描述每一场\r\n";
 
-    wchar_t start[64] = {0};
-    GetWindowTextW(hEditStart, start, 64);
-    text += L"start=" + std::wstring(start) + L"\r\n";
+    wchar_t count[16];
+    swprintf(count, 16, L"examCount=%d\r\n", g_examCount);
+    text += count;
+
+    for (int i = 0; i < g_examCount; i++)
+    {
+        wchar_t key[32];
+        swprintf(key, 32, L"exam%d_name=", i);
+        text += key;
+        text += g_exam[i].name;
+        text += L"\r\n";
+
+        swprintf(key, 32, L"exam%d_time=", i);
+        SYSTEMTIME st = FtToSystemTime(g_exam[i].startFt);
+        wchar_t buf[64];
+        swprintf(buf, 64, L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+        text += key;
+        text += buf;
+        text += L"\r\n";
+    }
 
     for (int i = 0; i < 3; i++)
     {
@@ -293,11 +345,14 @@ static void SaveSettings()
 
     std::wstring path = ConfigPath();
 
+    // 写入 UTF-8 BOM，保证 Win7 记事本直接打开也不会乱码
+    std::string utf8("\xEF\xBB\xBF", 3);
     int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), NULL, 0, NULL, NULL);
-    std::string utf8(need > 0 ? need : 0, '\0');
     if (need > 0)
     {
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[0], need, NULL, NULL);
+        size_t base = utf8.size();
+        utf8.resize(base + need);
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[base], need, NULL, NULL);
     }
 
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -308,8 +363,89 @@ static void SaveSettings()
     CloseHandle(file);
 }
 
+// 距当前若干分钟的整分钟时刻（秒固定为 0）
+static __int64 FtFromNowMinutes(int minutes)
+{
+    __int64 ft = FtNow() + (__int64)minutes * 60 * 10000000LL;
+    SYSTEMTIME st = FtToSystemTime(ft);
+    st.wSecond = 0;
+    st.wMilliseconds = 0;
+    return SystemTimeToFt(st);
+}
+
+// 按开始时间升序插入，返回插入后的下标
+static int AddExam(const std::wstring& name, __int64 startFt)
+{
+    if (g_examCount >= MAX_EXAMS) return -1;
+
+    int pos = g_examCount;
+    for (int i = 0; i < g_examCount; i++)
+    {
+        if (startFt < g_exam[i].startFt)
+        {
+            pos = i;
+            break;
+        }
+    }
+
+    for (int i = g_examCount; i > pos; i--)
+    {
+        g_exam[i] = g_exam[i - 1];
+    }
+
+    Exam& e = g_exam[pos];
+    e.name = name;
+    e.startFt = startFt;
+    for (int k = 0; k < NODE_COUNT; k++)
+    {
+        e.nodeFt[k] = 0;
+        e.nodeState[k] = ST_NONE;
+    }
+    g_examCount++;
+    return pos;
+}
+
+static void RemoveExam(int index)
+{
+    if (index < 0 || index >= g_examCount) return;
+    for (int i = index; i < g_examCount - 1; i++)
+    {
+        g_exam[i] = g_exam[i + 1];
+    }
+    g_examCount--;
+    g_exam[g_examCount].name.clear();
+    g_exam[g_examCount].startFt = 0;
+}
+
+static bool ParseDateTimeText(const std::wstring& raw, __int64* outFt)
+{
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    bool hasSeconds = false;
+
+    if (swscanf(raw.c_str(), L"%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) hasSeconds = true;
+    else if (swscanf(raw.c_str(), L"%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) != 5) return false;
+
+    if (y < 1970 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+    if (h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) return false;
+    if (!hasSeconds) s = 0;
+
+    SYSTEMTIME st;
+    ZeroMemory(&st, sizeof(st));
+    st.wYear = (WORD)y;
+    st.wMonth = (WORD)mo;
+    st.wDay = (WORD)d;
+    st.wHour = (WORD)h;
+    st.wMinute = (WORD)mi;
+    st.wSecond = (WORD)s;
+
+    *outFt = SystemTimeToFt(st);
+    return true;
+}
+
 static void LoadSettings()
 {
+    std::vector<std::wstring> names;
+    std::vector<std::wstring> times;
     std::wstring startValue;
     std::wstring audioValue[3];
     bool hasConfig = false;
@@ -338,6 +474,9 @@ static void LoadSettings()
                 std::wstring text(need, L'\0');
                 MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), &text[0], need);
 
+                // 去掉可能的 UTF-8 BOM，避免首个键被污染
+                if (!text.empty() && text[0] == (wchar_t)0xFEFF) text.erase(0, 1);
+
                 size_t pos = 0;
                 while (pos < text.size())
                 {
@@ -359,6 +498,27 @@ static void LoadSettings()
                     else if (key == L"audio0") audioValue[0] = value;
                     else if (key == L"audio1") audioValue[1] = value;
                     else if (key == L"audio2") audioValue[2] = value;
+                    else if (key.size() >= 10 && key.compare(0, 4, L"exam") == 0)
+                    {
+                        // examN_name / examN_time
+                        size_t p = 4;
+                        int index = 0;
+                        while (p < key.size() && key[p] >= L'0' && key[p] <= L'9')
+                        {
+                            index = index * 10 + (key[p] - L'0');
+                            p++;
+                        }
+                        if (index >= MAX_EXAMS || p >= key.size()) continue;
+
+                        while (index >= (int)names.size())
+                        {
+                            names.push_back(L"");
+                            times.push_back(L"");
+                        }
+
+                        if (key.compare(p, key.size() - p, L"_name") == 0) names[index] = value;
+                        else if (key.compare(p, key.size() - p, L"_time") == 0) times[index] = value;
+                    }
                 }
             }
         }
@@ -366,15 +526,35 @@ static void LoadSettings()
         CloseHandle(file);
     }
 
-    if (hasConfig && !startValue.empty())
-    {
-        SetWindowTextW(hEditStart, startValue.c_str());
-    }
-
     for (int i = 0; i < 3; i++)
     {
         g_audio[i] = audioValue[i];
     }
+
+    // 兼容旧版单场配置：只有 start 键
+    if (names.empty() && !startValue.empty())
+    {
+        names.push_back(L"第 1 场");
+        times.push_back(startValue);
+    }
+
+    for (int i = 0; i < (int)names.size() && g_examCount < MAX_EXAMS; i++)
+    {
+        __int64 ft = 0;
+        if (!ParseDateTimeText(times[i], &ft)) continue;
+
+        std::wstring name = names[i];
+        if (name.empty()) name = L"第 " + std::to_wstring(g_examCount + 1) + L" 场";
+        AddExam(name, ft);
+    }
+
+    if (g_examCount == 0 && !hasConfig)
+    {
+        // 首次运行：自动排一场，省去用户先添加的步骤
+        AddExam(L"第 1 场", FtFromNowMinutes(30));
+    }
+
+    g_selectedExam = (g_examCount > 0) ? 0 : -1;
 }
 
 // 从 exe 同级 audio 目录按 01 / 02 / 03 前缀自动识别音频
@@ -746,6 +926,17 @@ static HWND MakeStatic(const wchar_t* text, int x, int y, int w, int h, HFONT fo
     return control;
 }
 
+// 自绘状态胶囊（与日程列表里的状态块保持一致的视觉）
+static HWND MakeChip(const wchar_t* text, int x, int y, int w, int h, HFONT font)
+{
+    HWND control = CreateWindowExW(0, L"STATIC", text,
+                                   WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                                   S(x), S(y), S(w), S(h),
+                                   g_hwnd, NULL, NULL, NULL);
+    SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
+    return control;
+}
+
 static HWND MakeGroup(const wchar_t* text, int x, int y, int w, int h)
 {
     HWND g = CreateWindowExW(0, L"BUTTON", text,
@@ -770,16 +961,40 @@ static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
 
 static WNDPROC g_editProc = NULL;
 
-static LRESULT CALLBACK StartEditProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+// 在名称输入框按回车等同于点击“添加到日程”
+static LRESULT CALLBACK NameEditProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
     if (msg == WM_KEYDOWN && w == VK_RETURN)
     {
-        PostMessageW(g_hwnd, WM_COMMAND, MAKELONG(ID_START, BN_CLICKED), 0);
+        PostMessageW(g_hwnd, WM_COMMAND, MAKELONG(ID_ADD_EXAM, BN_CLICKED), 0);
         return 0;
     }
     if (msg == WM_CHAR && w == VK_RETURN) return 0;
 
     return CallWindowProcW(g_editProc, h, msg, w, l);
+}
+
+static void SetDtpTime(__int64 ft)
+{
+    if (!hDtp) return;
+    SYSTEMTIME st = FtToSystemTime(ft);
+    st.wSecond = 0;
+    st.wMilliseconds = 0;
+    SendMessageW(hDtp, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
+}
+
+static __int64 GetDtpTime()
+{
+    if (!hDtp) return 0;
+
+    SYSTEMTIME st;
+    ZeroMemory(&st, sizeof(st));
+    if (SendMessageW(hDtp, DTM_GETSYSTEMTIME, 0, (LPARAM)&st) != GDT_VALID) return 0;
+    if (st.wYear < 1970) return 0;
+
+    st.wSecond = 0;
+    st.wMilliseconds = 0;
+    return SystemTimeToFt(st);
 }
 
 static void BuildUi()
@@ -792,20 +1007,22 @@ static void BuildUi()
     fSync    = MakeFont(85,  false);
     fCount   = MakeFont(115, true);
     fCap     = MakeFont(90,  false);
-    fEdit    = MakeFont(110, false);
+    fEdit    = MakeFont(105, false);
     fRow     = MakeFont(90,  false);
     fState   = MakeFont(85,  false);
     fHint    = MakeFont(85,  false);
     fLog     = MakeFont(85,  false);
     fBtnTool = MakeFont(85,  false);
     fStart   = MakeFont(150, true);
-    fStop    = MakeFont(260, true);
+    fStop    = MakeFont(160, true);
 
     // 刷子
     bBg         = CreateSolidBrush(C_BG);
     bSurface    = CreateSolidBrush(C_SURFACE);
     bLine       = CreateSolidBrush(C_LINE);
     bEdit       = CreateSolidBrush(C_SURFACE);
+    bSel        = CreateSolidBrush(RGB(234, 243, 238));
+    bSelHover   = CreateSolidBrush(RGB(242, 248, 245));
     bStatePend  = CreateSolidBrush(C_ST_PEND_BG);
     bStatePlay  = CreateSolidBrush(C_ST_PLAY_BG);
     bStateDone  = CreateSolidBrush(C_ST_DONE_BG);
@@ -830,75 +1047,96 @@ static void BuildUi()
     biDanger.pressed = C_RED_P;
 
     // 顶部
-    hTitle    = MakeStatic(L"考试自动打铃", 24, 10, 300, 40, fTitle, SS_LEFT);
-    hSubtitle = MakeStatic(L"北京时间基准 · 三段音频自动播放", 26, 52, 360, 22, fSub, SS_LEFT);
-    hCountdown = MakeStatic(L"待启动", 290, 22, 270, 30, fCount, SS_RIGHT);
+    hTitle    = MakeStatic(L"考试自动打铃", 24, 8, 320, 40, fTitle, SS_LEFT);
+    hSubtitle = MakeStatic(L"多场考试 · 北京时间基准 · 三段音频自动播放", 26, 48, 500, 22, fSub, SS_LEFT);
+    hCountdown = MakeStatic(L"待启动", 26, 70, 420, 26, fCount, SS_LEFT);
 
-    hClock = MakeStatic(L"--:--:--", 560, 4, 390, 42, fClock, SS_RIGHT);
-    hDate  = MakeStatic(L"北京时间", 560, 46, 390, 20, fDate, SS_RIGHT);
-    hSync  = MakeStatic(L"正在校时…", 560, 68, 288, 22, fSync, SS_RIGHT);
-    hBtnSync = MakeOwnedButton(L"重新校时", 862, 63, 88, 28, &biTool, fBtnTool, ID_SYNC);
+    hClock = MakeStatic(L"--:--:--", 620, 2, 380, 42, fClock, SS_RIGHT);
+    hDate  = MakeStatic(L"北京时间", 620, 44, 380, 20, fDate, SS_RIGHT);
+    hSync  = MakeStatic(L"正在校时…", 620, 66, 274, 22, fSync, SS_RIGHT);
+    hBtnSync = MakeOwnedButton(L"重新校时", 906, 62, 92, 28, &biTool, fBtnTool, ID_SYNC);
 
-    // 考试设置
-    hGrpSet   = MakeGroup(L"考试设置", 20, 114, 573, 114);
-    hLblSetCap = MakeStatic(L"考试开始时间（北京时间）", 34, 134, 300, 22, fCap, SS_LEFT);
+    // 考试日程
+    hGrpSet = MakeGroup(L"考试日程", 20, 112, 640, 276);
 
-    hEditStart = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
-                                 S(34), S(158), S(216), S(28),
-                                 g_hwnd, (HMENU)ID_EDIT_START, NULL, NULL);
-    SendMessageW(hEditStart, WM_SETFONT, (WPARAM)fEdit, TRUE);
-    SendMessageW(hEditStart, EM_SETLIMITTEXT, 32, 0);
+    hEditName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
+                                S(34), S(128), S(178), S(28),
+                                g_hwnd, (HMENU)ID_EDIT_NAME, NULL, NULL);
+    SendMessageW(hEditName, WM_SETFONT, (WPARAM)fEdit, TRUE);
+    SendMessageW(hEditName, EM_SETLIMITTEXT, 40, 0);
+    SendMessageW(hEditName, EM_SETCUEBANNER, TRUE, (LPARAM)L"考试名称");
+    g_editProc = (WNDPROC)SetWindowLongPtrW(hEditName, GWLP_WNDPROC, (LONG_PTR)NameEditProc);
 
-    g_editProc = (WNDPROC)SetWindowLongPtrW(hEditStart, GWLP_WNDPROC, (LONG_PTR)StartEditProc);
+    hDtp = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | DTS_SHORTDATECENTURYFORMAT,
+                           S(218), S(128), S(196), S(28),
+                           g_hwnd, (HMENU)ID_DTP, NULL, NULL);
+    SendMessageW(hDtp, WM_SETFONT, (WPARAM)fEdit, TRUE);
+    SendMessageW(hDtp, DTM_SETFORMATW, 0, (LPARAM)L"yyyy'-'MM'-'dd  HH':'mm");
+    SetDtpTime(FtFromNowMinutes(30));
 
-    hBtnFill = MakeOwnedButton(L"填入当前 +30 分钟", 258, 158, 142, 28, &biTool, fBtnTool, ID_FILL);
-    hHint = MakeStatic(L"格式 YYYY-MM-DD HH:MM:SS，例如 2026-10-30 09:00:00", 34, 190, 480, 20, fHint, SS_LEFT);
+    hBtnNow = MakeOwnedButton(L"现在 +30", 418, 128, 86, 28, &biTool, fBtnTool, ID_NOW30);
+    hBtnAdd = MakeOwnedButton(L"添加到日程", 510, 128, 116, 28, &biPrimary, fBtnTool, ID_ADD_EXAM);
+
+    hSetHint = MakeStatic(L"填写名称与开始时间（北京时间），可连续添加多场，程序按先后顺序自动打铃",
+                          34, 162, 590, 20, fHint, SS_LEFT);
+
+    hExamList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                                S(34), S(186), S(592), S(152),
+                                g_hwnd, (HMENU)ID_EXAM_LIST, NULL, NULL);
+    SendMessageW(hExamList, WM_SETFONT, (WPARAM)fRow, TRUE);
+    SendMessageW(hExamList, LB_SETITEMHEIGHT, 0, (LPARAM)S(48));
+
+    hListHint = MakeStatic(L"暂无场次\n填写名称与时间后点击「添加到日程」",
+                           34, 240, 592, 52, fState, SS_CENTER);
+    ShowWindow(hListHint, SW_SHOW);
+
+    hBtnDel   = MakeOwnedButton(L"删除选中", 34, 340, 100, 28, &biTool, fBtnTool, ID_DEL_EXAM);
+    hBtnClear = MakeOwnedButton(L"清空日程", 142, 340, 88, 28, &biTool, fBtnTool, ID_CLEAR_EXAM);
+    hExamCount = MakeStatic(L"共 0 场", 400, 344, 226, 24, fState, SS_RIGHT);
 
     // 打铃节点
-    hGrpNode = MakeGroup(L"打铃节点", 20, 238, 573, 170);
-    MakeStatic(L"节点", 34, 258, 200, 20, fState, SS_LEFT);
-    MakeStatic(L"预定时间", 290, 258, 150, 20, fState, SS_LEFT);
-    MakeStatic(L"状态", 468, 258, 100, 20, fState, SS_LEFT);
+    hGrpNode = MakeGroup(L"打铃节点", 20, 396, 640, 146);
+    hNodeTitle = MakeStatic(L"未选择场次", 34, 414, 460, 20, fRow, SS_LEFT);
+    MakeStatic(L"节点", 34, 436, 200, 20, fState, SS_LEFT);
+    MakeStatic(L"预定时间", 350, 436, 130, 20, fState, SS_LEFT);
+    MakeStatic(L"状态", 496, 436, 110, 20, fState, SS_LEFT);
 
-    const wchar_t* names[3] = {
-        L"考前 10 分钟 · 考生进入考场",
-        L"考前 5 分钟 · 下发试卷与答题卡",
-        L"考试开始 · 考生开始作答"
-    };
-
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = 280 + i * 36;
-        hNodeName[i] = MakeStatic(names[i], 34, y + 8, 252, 22, fRow, SS_LEFT);
-        hNodeTime[i] = MakeStatic(L"—", 290, y + 8, 160, 22, fRow, SS_LEFT);
-        hNodeState[i] = MakeStatic(L"未排期", 476, y + 4, 84, 26, fState, SS_CENTER | SS_CENTERIMAGE);
+        int y = 456 + i * 26;
+        hNodeName[i]  = MakeStatic(kNodeName[i], 34, y, 306, 24, fRow, SS_LEFT);
+        hNodeTime[i]  = MakeStatic(L"—", 350, y, 130, 24, fRow, SS_LEFT);
+        hNodeState[i] = MakeChip(L"未排期", 494, y, 120, 24, fState);
     }
 
     // 音频文件
-    hGrpAudio = MakeGroup(L"音频文件", 20, 418, 573, 136);
-    const wchar_t* caps[3] = { L"考前 10 分钟", L"考前 5 分钟", L"考试开始" };
+    hGrpAudio = MakeGroup(L"音频文件", 20, 548, 640, 124);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = 434 + i * 34;
-        hAudioCap[i] = MakeStatic(caps[i], 34, y + 6, 92, 22, fRow, SS_LEFT);
-        hAudioFile[i] = MakeStatic(L"未选择（点击“选择”添加）", 128, y + 6, 330, 22, fState, SS_LEFT);
-        hBtnPick[i] = MakeOwnedButton(L"选择", 466, y, 60, 28, &biTool, fBtnTool, ID_PICK0 + i);
-        hBtnPlay[i] = MakeOwnedButton(L"试听", 530, y, 60, 28, &biTool, fBtnTool, ID_PLAY0 + i);
+        int y = 562 + i * 32;
+        hAudioCap[i]  = MakeStatic(kNodeShort[i], 34, y, 92, 24, fRow, SS_LEFT);
+        hAudioFile[i] = MakeStatic(L"未选择（点击“选择”添加）", 130, y, 330, 24, fState, SS_LEFT);
+        hBtnPick[i]   = MakeOwnedButton(L"选择", 466, y, 58, 26, &biTool, fBtnTool, ID_PICK0 + i);
+        hBtnPlay[i]   = MakeOwnedButton(L"试听", 530, y, 58, 26, &biTool, fBtnTool, ID_PLAY0 + i);
     }
 
     // 运行日志
-    hGrpLog = MakeGroup(L"运行日志", 605, 114, 355, 440);
+    hGrpLog = MakeGroup(L"运行日志", 680, 112, 320, 560);
     hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
-                           S(619), S(136), S(327), S(406),
+                           S(694), S(134), S(292), S(526),
                            g_hwnd, (HMENU)ID_LOG, NULL, NULL);
     SendMessageW(hLog, WM_SETFONT, (WPARAM)fLog, TRUE);
 
     // 底部操作
-    hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 572, 300, 112, &biPrimary, fStart, ID_START);
-    hBtnStop  = MakeOwnedButton(L"急  停", 334, 572, 626, 112, &biDanger, fStop, ID_STOP);
+    hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 690, 320, 56, &biPrimary, fStart, ID_START);
+    hBtnStop  = MakeOwnedButton(L"急  停", 348, 690, 300, 56, &biDanger, fStop, ID_STOP);
+    hFootHint = MakeStatic(L"按 Esc 亦可急停", 664, 706, 336, 24, fHint, SS_RIGHT);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,31 +1152,116 @@ static const wchar_t* StateText(int state)
         case ST_MISS: return L"已错过";
         case ST_CANC: return L"已取消";
     }
-    return L"未知";
+    return L"未开始";
 }
 
-static void UpdateNodeRow(int index)
+// 单场考试的汇总状态：只要还有节点在播/待触发，就以外层为准
+static int ExamAggState(int exam)
 {
-    if (index < 0 || index > 2) return;
+    if (exam < 0 || exam >= g_examCount) return ST_NONE;
 
-    if (g_nodeState[index] == ST_NONE)
+    bool anyPend = false, anyPlay = false, anyCnc = false, anyMiss = false, anyDone = false;
+    for (int k = 0; k < NODE_COUNT; k++)
     {
-        SetWindowTextW(hNodeTime[index], L"—");
-        SetWindowTextW(hNodeState[index], L"未排期");
-    }
-    else
-    {
-        SetWindowTextW(hNodeTime[index], FormatTime(g_nodeFt[index]).c_str());
-        SetWindowTextW(hNodeState[index], StateText(g_nodeState[index]));
+        switch (g_exam[exam].nodeState[k])
+        {
+            case ST_PEND: anyPend = true; break;
+            case ST_PLAY: anyPlay = true; break;
+            case ST_CANC: anyCnc  = true; break;
+            case ST_MISS: anyMiss = true; break;
+            case ST_DONE: anyDone = true; break;
+        }
     }
 
-    InvalidateRect(hNodeState[index], NULL, TRUE);
-    InvalidateRect(hNodeTime[index], NULL, TRUE);
+    if (anyPlay) return ST_PLAY;
+    if (anyPend) return ST_PEND;
+    if (anyCnc)  return ST_CANC;
+    if (anyMiss) return ST_MISS;
+    if (anyDone) return ST_DONE;
+    return ST_NONE;
+}
+
+// 未排期但已过预定时刻的场次，界面上按“已过期”呈现
+static int ExamDisplayState(int exam)
+{
+    int state = ExamAggState(exam);
+    if (state != ST_NONE) return state;
+
+    if (exam >= 0 && exam < g_examCount &&
+        FtNow() - g_exam[exam].startFt > 60LL * 10000000LL)
+    {
+        return ST_MISS;
+    }
+    return ST_NONE;
+}
+
+static const wchar_t* ExamStatusText(int exam)
+{
+    switch (ExamDisplayState(exam))
+    {
+        case ST_PEND: return L"待触发";
+        case ST_PLAY: return L"播放中";
+        case ST_DONE: return L"已完成";
+        case ST_MISS: return L"已过期";
+        case ST_CANC: return L"已取消";
+    }
+    return L"未开始";
+}
+
+// 选中场次当前展示的节点状态
+static int NodeStateAt(int kind)
+{
+    if (g_selectedExam < 0 || g_selectedExam >= g_examCount) return ST_NONE;
+    if (kind < 0 || kind >= NODE_COUNT) return ST_NONE;
+
+    const Exam& e = g_exam[g_selectedExam];
+    if (e.nodeState[kind] != ST_NONE) return e.nodeState[kind];
+
+    __int64 ft = e.startFt + (__int64)kNodeOffsetMin[kind] * 60LL * 10000000LL;
+    if (FtNow() - ft > 60LL * 10000000LL) return ST_MISS;
+    return ST_NONE;
+}
+
+static void UpdateNodePanel()
+{
+    int exam = g_selectedExam;
+
+    if (exam < 0 || exam >= g_examCount)
+    {
+        SetWindowTextW(hNodeTitle, L"未选择场次");
+        for (int i = 0; i < NODE_COUNT; i++)
+        {
+            SetWindowTextW(hNodeTime[i], L"—");
+            SetWindowTextW(hNodeState[i], L"未排期");
+            InvalidateRect(hNodeState[i], NULL, TRUE);
+        }
+        return;
+    }
+
+    const Exam& e = g_exam[exam];
+    SetWindowTextW(hNodeTitle, (L"打铃节点 · " + e.name).c_str());
+
+    const __int64 minute = 60LL * 10000000LL;
+
+    for (int i = 0; i < NODE_COUNT; i++)
+    {
+        int state = NodeStateAt(i);
+        __int64 ft = (e.nodeState[i] == ST_NONE)
+                     ? e.startFt + (__int64)kNodeOffsetMin[i] * minute
+                     : e.nodeFt[i];
+
+        SetWindowTextW(hNodeTime[i], FormatMonthDayHm(ft).c_str());
+        SetWindowTextW(hNodeState[i],
+                       (state == ST_NONE) ? L"未开始" : StateText(state));
+        InvalidateRect(hNodeState[i], NULL, TRUE);
+        InvalidateRect(hNodeTime[i], NULL, TRUE);
+    }
 }
 
 static void UpdateAllNodeRows()
 {
-    for (int i = 0; i < 3; i++) UpdateNodeRow(i);
+    UpdateNodePanel();
+    InvalidateRect(hExamList, NULL, TRUE);
 }
 
 static void UpdateAudioLabel(int index)
@@ -961,24 +1284,70 @@ static void UpdateAudioLabel(int index)
     InvalidateRect(hAudioFile[index], NULL, TRUE);
 }
 
+static void RefreshExamList()
+{
+    SendMessageW(hExamList, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(hExamList, LB_RESETCONTENT, 0, 0);
+
+    for (int i = 0; i < g_examCount; i++)
+    {
+        SendMessageW(hExamList, LB_ADDSTRING, 0, (LPARAM)g_exam[i].name.c_str());
+    }
+
+    SendMessageW(hExamList, WM_SETREDRAW, TRUE, 0);
+
+    if (g_selectedExam >= 0 && g_selectedExam < g_examCount)
+    {
+        SendMessageW(hExamList, LB_SETCURSEL, g_selectedExam, 0);
+    }
+    else
+    {
+        g_selectedExam = (g_examCount > 0) ? 0 : -1;
+        if (g_selectedExam >= 0) SendMessageW(hExamList, LB_SETCURSEL, 0, 0);
+    }
+
+    wchar_t buf[64];
+    swprintf(buf, 64, L"共 %d 场%s", g_examCount,
+             g_examCount == 0 ? L" · 请先添加" : L"");
+    SetWindowTextW(hExamCount, buf);
+
+    ShowWindow(hListHint, g_examCount == 0 ? SW_SHOW : SW_HIDE);
+
+    if (!g_running)
+    {
+        EnableWindow(hBtnDel, g_examCount > 0);
+        EnableWindow(hBtnClear, g_examCount > 0);
+    }
+
+    InvalidateRect(hExamList, NULL, TRUE);
+    UpdateNodePanel();
+}
+
 static void UpdateCountdown()
 {
     if (g_running)
     {
-        int best = -1;
-        for (int i = 0; i < 3; i++)
+        int bestExam = -1, bestKind = -1;
+        for (int i = 0; i < g_examCount; i++)
         {
-            if (g_nodeState[i] != ST_PEND) continue;
-            if (best < 0 || g_nodeFt[i] < g_nodeFt[best]) best = i;
+            for (int k = 0; k < NODE_COUNT; k++)
+            {
+                if (g_exam[i].nodeState[k] != ST_PEND) continue;
+                if (bestExam < 0 || g_exam[i].nodeFt[k] < g_exam[bestExam].nodeFt[bestKind])
+                {
+                    bestExam = i;
+                    bestKind = k;
+                }
+            }
         }
 
-        if (best < 0)
+        if (bestExam < 0)
         {
             SetWindowTextW(hCountdown, L"本轮任务已完成");
         }
         else
         {
-            __int64 remain = g_nodeFt[best] - FtNow();
+            __int64 remain = g_exam[bestExam].nodeFt[bestKind] - FtNow();
             if (remain < 0) remain = 0;
 
             __int64 totalSeconds = remain / 10000000LL;
@@ -1013,13 +1382,26 @@ static void UpdateCountdown()
 // ---------------------------------------------------------------------------
 // 打铃调度
 // ---------------------------------------------------------------------------
-static void TriggerBell(int index)
+static void TriggerBell(int exam, int kind)
 {
-    g_nodeState[index] = ST_PLAY;
-    UpdateNodeRow(index);
-    Log(L"打铃：" + NodeName(index));
+    if (exam < 0 || exam >= g_examCount) return;
 
-    std::wstring file = g_audio[index];
+    Exam& e = g_exam[exam];
+
+    // 上一段还没播完，直接按完成处理，避免状态卡在“播放中”
+    if (g_playExam >= 0 && g_playExam < g_examCount &&
+        g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+    {
+        g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+    }
+    g_playExam = -1;
+    g_playKind = -1;
+
+    e.nodeState[kind] = ST_PLAY;
+    UpdateAllNodeRows();
+    Log(L"打铃：" + e.name + L" · " + NodeName(kind));
+
+    std::wstring file = g_audio[kind];
 
     if (!file.empty())
     {
@@ -1027,7 +1409,8 @@ static void TriggerBell(int index)
         {
             if (MciPlay(file))
             {
-                g_playingIndex = index;
+                g_playExam = exam;
+                g_playKind = kind;
                 return;
             }
             Log(L"音频播放失败，改用系统提示音");
@@ -1043,16 +1426,18 @@ static void TriggerBell(int index)
     }
 
     MessageBeep(MB_ICONEXCLAMATION);
-    g_nodeState[index] = ST_DONE;
-    UpdateNodeRow(index);
-    g_playingIndex = -1;
+    e.nodeState[kind] = ST_DONE;
+    UpdateAllNodeRows();
 }
 
 static void CheckAllFinished()
 {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < g_examCount; i++)
     {
-        if (g_nodeState[i] == ST_PEND || g_nodeState[i] == ST_PLAY) return;
+        for (int k = 0; k < NODE_COUNT; k++)
+        {
+            if (g_exam[i].nodeState[k] == ST_PEND || g_exam[i].nodeState[k] == ST_PLAY) return;
+        }
     }
 
     if (!g_running) return;
@@ -1061,9 +1446,16 @@ static void CheckAllFinished()
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
-    EnableWindow(hEditStart, TRUE);
 
-    Log(L"本轮任务全部结束，可安排下一场");
+    EnableWindow(hEditName, TRUE);
+    EnableWindow(hDtp, TRUE);
+    EnableWindow(hBtnAdd, TRUE);
+    EnableWindow(hBtnNow, TRUE);
+    EnableWindow(hBtnDel, TRUE);
+    EnableWindow(hBtnClear, TRUE);
+    EnableWindow(hExamList, TRUE);
+
+    Log(L"全部场次任务已结束，可继续添加或重新启动");
     UpdateCountdown();
 }
 
@@ -1079,35 +1471,53 @@ static void OnTick()
     if (dateText  != lastDate)  { lastDate  = dateText;  SetWindowTextW(hDate,  dateText.c_str());  }
 
     // 播放结束检测
-    if (g_playingIndex >= 0 && !MciIsPlaying())
+    if (g_playExam >= 0 && !MciIsPlaying())
     {
-        Log(L"播放结束：" + NodeName(g_playingIndex));
-        g_nodeState[g_playingIndex] = ST_DONE;
-        UpdateNodeRow(g_playingIndex);
-        g_playingIndex = -1;
+        if (g_playExam < g_examCount && g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+        {
+            g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+            Log(L"播放结束：" + g_exam[g_playExam].name + L" · " + NodeName(g_playKind));
+        }
+        g_playExam = -1;
+        g_playKind = -1;
+        UpdateAllNodeRows();
     }
 
     if (!g_running)
     {
+        // 空闲时也定期刷新，让“已过期”这类按时间推导的状态能跟上
+        static ULONGLONG lastIdleRefresh = 0;
+        ULONGLONG nowTick = GetTickCount64();
+        if (nowTick - lastIdleRefresh >= 2000)
+        {
+            lastIdleRefresh = nowTick;
+            UpdateNodePanel();
+            InvalidateRect(hExamList, NULL, TRUE);
+        }
+
         UpdateCountdown();
         return;
     }
 
-    for (int i = 0; i < 3; i++)
-    {
-        if (g_nodeState[i] != ST_PEND) continue;
-        if (now < g_nodeFt[i]) continue;
+    const __int64 tolerance = 60LL * 10000000LL;
 
-        __int64 late = now - g_nodeFt[i];
-        if (late <= 60LL * 10000000LL)
+    for (int i = 0; i < g_examCount; i++)
+    {
+        for (int k = 0; k < NODE_COUNT; k++)
         {
-            TriggerBell(i);          // 60 秒容差内立即补响
-        }
-        else
-        {
-            g_nodeState[i] = ST_MISS;
-            UpdateNodeRow(i);
-            Log(L"已错过：" + NodeName(i) + L"（预定 " + FormatTime(g_nodeFt[i]) + L"）");
+            if (g_exam[i].nodeState[k] != ST_PEND) continue;
+            if (now < g_exam[i].nodeFt[k]) continue;
+
+            if (now - g_exam[i].nodeFt[k] <= tolerance)
+            {
+                TriggerBell(i, k);          // 60 秒容差内立即补响
+            }
+            else
+            {
+                g_exam[i].nodeState[k] = ST_MISS;
+                Log(L"已错过：" + g_exam[i].name + L" · " + NodeName(k));
+                UpdateAllNodeRows();
+            }
         }
     }
 
@@ -1118,56 +1528,56 @@ static void OnTick()
 // ---------------------------------------------------------------------------
 // 启动与急停
 // ---------------------------------------------------------------------------
-static bool ParseStartTime(__int64* outFt)
-{
-    wchar_t buf[64] = {0};
-    GetWindowTextW(hEditStart, buf, 64);
-
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (swscanf(buf, L"%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return false;
-    if (y < 1970 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
-    if (h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) return false;
-
-    SYSTEMTIME st;
-    ZeroMemory(&st, sizeof(st));
-    st.wYear = (WORD)y;
-    st.wMonth = (WORD)mo;
-    st.wDay = (WORD)d;
-    st.wHour = (WORD)h;
-    st.wMinute = (WORD)mi;
-    st.wSecond = (WORD)s;
-
-    FILETIME ft;
-    if (!SystemTimeToFileTime(&st, &ft)) return false;
-
-    LARGE_INTEGER li;
-    li.LowPart = ft.dwLowDateTime;
-    li.HighPart = ft.dwHighDateTime;
-    *outFt = li.QuadPart;
-    return true;
-}
-
-static void StartMonitoring(__int64 startFt)
+static void StartMonitoring()
 {
     g_stoppedByUser = false;
-    g_playingIndex = -1;
+    g_playExam = -1;
+    g_playKind = -1;
     MciClose();
 
     __int64 now = FtNow();
     const __int64 minute = 60LL * 10000000LL;
+    const __int64 tolerance = 60LL * 10000000LL;
 
-    g_nodeFt[0] = startFt - 10 * minute;
-    g_nodeFt[1] = startFt - 5 * minute;
-    g_nodeFt[2] = startFt;
+    int activeNodes = 0;
+    int firstActive = -1;
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < g_examCount; i++)
     {
-        __int64 late = now - g_nodeFt[i];
-        g_nodeState[i] = (late > 60 * 10000000LL) ? ST_MISS : ST_PEND;
-        if (g_nodeState[i] == ST_MISS)
+        Exam& e = g_exam[i];
+        bool allPast = true;
+
+        for (int k = 0; k < NODE_COUNT; k++)
         {
-            Log(L"节点已过：" + NodeName(i) + L"（" + FormatTime(g_nodeFt[i]) + L"）");
+            e.nodeFt[k] = e.startFt + (__int64)kNodeOffsetMin[k] * minute;
+
+            if (now - e.nodeFt[k] > tolerance)
+            {
+                e.nodeState[k] = ST_MISS;
+            }
+            else
+            {
+                e.nodeState[k] = ST_PEND;
+                allPast = false;
+                activeNodes++;
+            }
         }
+
+        if (allPast)
+        {
+            Log(L"跳过已过期：" + e.name + L" " + FormatMonthDayHm(e.startFt));
+        }
+        else if (firstActive < 0)
+        {
+            firstActive = i;
+        }
+    }
+
+    // 自动把面板切到第一场未结束的考试，避免默认停在过期场次上
+    if (firstActive >= 0)
+    {
+        g_selectedExam = firstActive;
+        SendMessageW(hExamList, LB_SETCURSEL, firstActive, 0);
     }
 
     g_running = true;
@@ -1175,9 +1585,18 @@ static void StartMonitoring(__int64 startFt)
     EnableWindow(hBtnStart, FALSE);
     SetWindowTextW(hBtnStart, L"运 行 中");
     InvalidateRect(hBtnStart, NULL, TRUE);
-    EnableWindow(hEditStart, FALSE);
 
-    Log(L"开始监测 · 考试开始 " + FormatTime(startFt));
+    EnableWindow(hEditName, FALSE);
+    EnableWindow(hDtp, FALSE);
+    EnableWindow(hBtnAdd, FALSE);
+    EnableWindow(hBtnNow, FALSE);
+    EnableWindow(hBtnDel, FALSE);
+    EnableWindow(hBtnClear, FALSE);
+    EnableWindow(hExamList, FALSE);
+
+    wchar_t buf[64];
+    swprintf(buf, 64, L"开始监测 · 共 %d 场，%d 个节点待触发", g_examCount, activeNodes);
+    Log(buf);
 
     UpdateAllNodeRows();
     UpdateCountdown();
@@ -1194,13 +1613,17 @@ static void PerformEmergencyStop()
 
     MciStop();
     MciClose();
-    g_playingIndex = -1;
+    g_playExam = -1;
+    g_playKind = -1;
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < g_examCount; i++)
     {
-        if (g_nodeState[i] == ST_PEND || g_nodeState[i] == ST_PLAY)
+        for (int k = 0; k < NODE_COUNT; k++)
         {
-            g_nodeState[i] = ST_CANC;
+            if (g_exam[i].nodeState[k] == ST_PEND || g_exam[i].nodeState[k] == ST_PLAY)
+            {
+                g_exam[i].nodeState[k] = ST_CANC;
+            }
         }
     }
 
@@ -1210,33 +1633,143 @@ static void PerformEmergencyStop()
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
-    EnableWindow(hEditStart, TRUE);
 
-    Log(L"【急停】已停止播放并取消后续任务");
+    EnableWindow(hEditName, TRUE);
+    EnableWindow(hDtp, TRUE);
+    EnableWindow(hBtnAdd, TRUE);
+    EnableWindow(hBtnNow, TRUE);
+    EnableWindow(hBtnDel, TRUE);
+    EnableWindow(hBtnClear, TRUE);
+    EnableWindow(hExamList, TRUE);
+
+    Log(L"【急停】已停止播放并取消全部后续任务");
 
     UpdateAllNodeRows();
     UpdateCountdown();
 }
 
-static void FillStartFromClock()
+// 清空输入区域，便于继续添加下一场
+static void ResetInputRow()
 {
-    __int64 ft = FtNow() + 30LL * 60 * 10000000LL;
-
-    SYSTEMTIME st = FtToSystemTime(ft);
-    st.wSecond = 0;
-    st.wMilliseconds = 0;
-
-    wchar_t buf[64];
-    swprintf(buf, 64, L"%04d-%02d-%02d %02d:%02d:%02d",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    SetWindowTextW(hEditStart, buf);
+    SetWindowTextW(hEditName, L"");
+    SetDtpTime(FtFromNowMinutes(30));
 }
 
-static void FillDefaultStartIfEmpty()
+static void AddExamFromInput()
 {
-    wchar_t buf[8] = {0};
-    GetWindowTextW(hEditStart, buf, 8);
-    if (buf[0] == L'\0') FillStartFromClock();
+    if (g_running)
+    {
+        MessageBoxW(g_hwnd, L"监测进行中，无法修改日程。请先急停或等待本轮结束。",
+                    L"暂不可编辑", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if (g_examCount >= MAX_EXAMS)
+    {
+        wchar_t buf[128];
+        swprintf(buf, 128, L"最多可排 %d 场考试，请先删除部分场次。", MAX_EXAMS);
+        MessageBoxW(g_hwnd, buf, L"数量已满", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    __int64 startFt = GetDtpTime();
+
+    wchar_t nameBuf[128] = {0};
+    GetWindowTextW(hEditName, nameBuf, 128);
+    std::wstring name = Trim(nameBuf);
+
+    if (startFt <= 0)
+    {
+        MessageBoxW(g_hwnd, L"请选择有效的考试开始时间。", L"时间无效", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // 同一时刻已有场次时不重复添加
+    for (int i = 0; i < g_examCount; i++)
+    {
+        if (g_exam[i].startFt == startFt)
+        {
+            MessageBoxW(g_hwnd, L"该开始时间的场次已存在，请调整时间。",
+                        L"重复添加", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
+    bool inPast = (startFt <= FtNow());
+    if (inPast)
+    {
+        if (MessageBoxW(g_hwnd,
+                        (L"开始时间已过去（当前 " + FormatDateTime(FtNow()) + L"）。\r\n"
+                         L"仍要添加吗？该场次启动后将全部标记为已错过。").c_str(),
+                        L"时间已过", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        {
+            return;
+        }
+    }
+
+    if (name.empty()) name = L"第 " + std::to_wstring(g_examCount + 1) + L" 场";
+
+    int pos = AddExam(name, startFt);
+    if (pos < 0) return;
+
+    g_selectedExam = pos;
+    RefreshExamList();
+    SaveSettings();
+    ResetInputRow();
+    SetFocus(hEditName);
+
+    Log(L"已添加：" + name + L" " + FormatMonthDayHm(startFt));
+}
+
+static void DeleteSelectedExam()
+{
+    if (g_running)
+    {
+        Log(L"监测进行中，暂不能删除场次");
+        return;
+    }
+
+    int sel = (int)SendMessageW(hExamList, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_examCount)
+    {
+        MessageBoxW(g_hwnd, L"请先在日程列表中选中要删除的场次。",
+                    L"未选中场次", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring name = g_exam[sel].name;
+    RemoveExam(sel);
+
+    if (g_selectedExam >= g_examCount) g_selectedExam = g_examCount - 1;
+    else if (g_selectedExam > sel) g_selectedExam--;
+    if (g_selectedExam < 0 && g_examCount > 0) g_selectedExam = 0;
+
+    RefreshExamList();
+    SaveSettings();
+    Log(L"已删除：" + name);
+}
+
+static void ClearExams()
+{
+    if (g_running)
+    {
+        Log(L"监测进行中，暂不能清空日程");
+        return;
+    }
+
+    if (g_examCount == 0) return;
+
+    if (MessageBoxW(g_hwnd, L"确定清空全部场次吗？此操作不可撤销。",
+                    L"清空日程", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+    {
+        return;
+    }
+
+    g_examCount = 0;
+    g_selectedExam = -1;
+    RefreshExamList();
+    SaveSettings();
+    Log(L"已清空全部场次");
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,11 +1815,13 @@ static void PreviewAudio(int index)
         return;
     }
 
-    if (g_playingIndex >= 0)
+    if (g_playExam >= 0 && g_playExam < g_examCount &&
+        g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
     {
-        g_nodeState[g_playingIndex] = ST_DONE;
-        UpdateNodeRow(g_playingIndex);
-        g_playingIndex = -1;
+        g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+        g_playExam = -1;
+        g_playKind = -1;
+        UpdateAllNodeRows();
     }
 
     if (!MciPlay(g_audio[index]))
@@ -1345,11 +1880,118 @@ static COLORREF StateColor(int state)
 
 static int StateIndexOf(HWND h)
 {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < NODE_COUNT; i++)
     {
         if (h == hNodeState[i]) return i;
     }
     return -1;
+}
+
+static void DrawNodeChip(LPDRAWITEMSTRUCT d, int kind)
+{
+    int state = NodeStateAt(kind);
+
+    HBRUSH back = CreateSolidBrush(C_BG);
+    FillRect(d->hDC, &d->rcItem, back);
+    DeleteObject(back);
+
+    RECT r = d->rcItem;
+    r.right -= 1;
+    r.bottom -= 1;
+
+    HGDIOBJ oldBrush = SelectObject(d->hDC, StateBrush(state));
+    HPEN pen = CreatePen(PS_SOLID, 1, StateBgColor(state));
+    HGDIOBJ oldPen = SelectObject(d->hDC, pen);
+    RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, S(10), S(10));
+    SelectObject(d->hDC, oldPen);
+    SelectObject(d->hDC, oldBrush);
+    DeleteObject(pen);
+
+    wchar_t text[64] = {0};
+    GetWindowTextW(d->hwndItem, text, 64);
+
+    SetBkMode(d->hDC, TRANSPARENT);
+    SetTextColor(d->hDC, StateColor(state));
+
+    HGDIOBJ oldFont = SelectObject(d->hDC, fState);
+    DrawTextW(d->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(d->hDC, oldFont);
+}
+
+// 日程列表自绘：左侧名称 + 开始时间，右侧状态胶囊
+static void DrawExamListItem(LPDRAWITEMSTRUCT d)
+{
+    int index = (int)d->itemID;
+    RECT r = d->rcItem;
+
+    if (index < 0 || index >= g_examCount)
+    {
+        FillRect(d->hDC, &r, bSurface);
+        return;
+    }
+
+    bool selected = (d->itemState & ODS_SELECTED) != 0;
+    bool focused  = (d->itemState & ODS_FOCUS) != 0;
+
+    HBRUSH fill = selected ? bSel : (focused ? bSelHover : bSurface);
+    FillRect(d->hDC, &r, fill);
+
+    // 分隔线
+    HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
+    HGDIOBJ oldPen = SelectObject(d->hDC, pen);
+    MoveToEx(d->hDC, r.left + S(12), r.bottom - 1, NULL);
+    LineTo(d->hDC, r.right - S(12), r.bottom - 1);
+    SelectObject(d->hDC, oldPen);
+    DeleteObject(pen);
+
+    const Exam& e = g_exam[index];
+
+    SetBkMode(d->hDC, TRANSPARENT);
+
+    RECT nameRect = r;
+    nameRect.left += S(12);
+    nameRect.right -= S(96);
+    nameRect.top += S(6);
+    nameRect.bottom = nameRect.top + S(20);
+
+    HGDIOBJ oldFont = SelectObject(d->hDC, fRow);
+    SetTextColor(d->hDC, C_INK);
+    DrawTextW(d->hDC, e.name.c_str(), -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    RECT timeRect = nameRect;
+    timeRect.top = nameRect.bottom + S(2);
+    timeRect.bottom = timeRect.top + S(18);
+
+    SelectObject(d->hDC, fState);
+    SetTextColor(d->hDC, C_MUTED);
+    DrawTextW(d->hDC, FormatDateTime(e.startFt).c_str(), -1, &timeRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 右侧状态胶囊
+    int state = ExamDisplayState(index);
+    const wchar_t* text = ExamStatusText(index);
+
+    RECT chip;
+    chip.right = r.right - S(12);
+    chip.left = chip.right - S(74);
+    chip.top = r.top + (r.bottom - r.top - S(24)) / 2;
+    chip.bottom = chip.top + S(24);
+
+    HBRUSH chipBrush = StateBrush(state);
+    HGDIOBJ oldBrush = SelectObject(d->hDC, chipBrush);
+    HPEN chipPen = CreatePen(PS_SOLID, 1, StateBgColor(state));
+    HGDIOBJ prevPen = SelectObject(d->hDC, chipPen);
+    RoundRect(d->hDC, chip.left, chip.top, chip.right, chip.bottom, S(10), S(10));
+    SelectObject(d->hDC, prevPen);
+    SelectObject(d->hDC, oldBrush);
+    DeleteObject(chipPen);
+
+    SetTextColor(d->hDC, StateColor(state));
+    SelectObject(d->hDC, fState);
+    RECT chipText = chip;
+    DrawTextW(d->hDC, text, -1, &chipText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(d->hDC, oldFont);
 }
 
 static void DrawOwnedButton(LPDRAWITEMSTRUCT d)
@@ -1434,10 +2076,8 @@ static void ApplySyncResult(SyncResult* result)
         SetWindowTextW(hSync, buf);
         g_syncTextColor = C_OKTXT;
 
-        Log(L"校时成功（" + result->source + L"）：" + FormatTime(FtNow()) +
-            L"，时延 " + std::to_wstring(result->roundTripMs) + L" ms");
-
-        FillDefaultStartIfEmpty();
+        Log(L"校时成功（" + result->source + L"）时延 " +
+            std::to_wstring(result->roundTripMs) + L" ms");
         return;
     }
 
@@ -1450,8 +2090,6 @@ static void ApplySyncResult(SyncResult* result)
     g_syncTextColor = C_BADTXT;
     Log(L"校时失败：" + result->message +
         (keptPrevious ? L"，继续沿用上次校正结果" : L"，已回退使用本机时间"));
-
-    FillDefaultStartIfEmpty();
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,15 +2118,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         FillRect(dc, &header, bSurface);
 
         RECT footer = client;
-        footer.top = S(560);
+        footer.top = S(682);
         FillRect(dc, &footer, bSurface);
 
         HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
         HGDIOBJ oldPen = SelectObject(dc, pen);
         MoveToEx(dc, 0, S(100) - 1, NULL);
         LineTo(dc, client.right, S(100) - 1);
-        MoveToEx(dc, 0, S(560), NULL);
-        LineTo(dc, client.right, S(560));
+        MoveToEx(dc, 0, S(682), NULL);
+        LineTo(dc, client.right, S(682));
         SelectObject(dc, oldPen);
         DeleteObject(pen);
 
@@ -1501,27 +2139,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HDC dc = (HDC)wParam;
         HWND control = (HWND)lParam;
 
-        int idx = StateIndexOf(control);
-        if (idx >= 0)
-        {
-            // 状态块用不透明背景，避免每秒刷新时残留旧字形
-            SetBkMode(dc, OPAQUE);
-            SetBkColor(dc, StateBgColor(g_nodeState[idx]));
-            SetTextColor(dc, StateColor(g_nodeState[idx]));
-            return (LRESULT)StateBrush(g_nodeState[idx]);
-        }
-
         bool onHeader = (control == hTitle || control == hSubtitle || control == hClock ||
                          control == hDate  || control == hSync     || control == hCountdown);
 
+        bool onSurface = onHeader || control == hListHint;
+
         SetBkMode(dc, OPAQUE);
-        SetBkColor(dc, onHeader ? C_SURFACE : C_BG);
+        SetBkColor(dc, onSurface ? C_SURFACE : C_BG);
 
         if (control == hSync) SetTextColor(dc, g_syncTextColor);
-        else if (control == hSubtitle || control == hDate) SetTextColor(dc, C_MUTED);
+        else if (control == hSubtitle || control == hDate || control == hListHint) SetTextColor(dc, C_MUTED);
         else SetTextColor(dc, C_INK);
 
-        return (LRESULT)(onHeader ? bSurface : bBg);
+        return (LRESULT)(onSurface ? bSurface : bBg);
     }
 
     case WM_CTLCOLOREDIT:
@@ -1533,9 +2163,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return (LRESULT)bEdit;
     }
 
+    case WM_CTLCOLORLISTBOX:
+    {
+        HDC dc = (HDC)wParam;
+        SetBkMode(dc, OPAQUE);
+        SetTextColor(dc, C_INK);
+        SetBkColor(dc, C_SURFACE);
+        return (LRESULT)bSurface;
+    }
+
     case WM_DRAWITEM:
-        DrawOwnedButton((LPDRAWITEMSTRUCT)lParam);
+    {
+        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lParam;
+
+        if (d->CtlType == ODT_LISTBOX)
+        {
+            DrawExamListItem(d);
+        }
+        else if (d->CtlType == ODT_STATIC)
+        {
+            int idx = StateIndexOf(d->hwndItem);
+            DrawNodeChip(d, idx < 0 ? 0 : idx);
+        }
+        else
+        {
+            DrawOwnedButton(d);
+        }
         return TRUE;
+    }
 
     case WM_COMMAND:
     {
@@ -1546,18 +2201,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             if (g_running || g_pendingStart) return 0;
 
-            __int64 startFt = 0;
-            if (!ParseStartTime(&startFt))
+            if (g_examCount == 0)
             {
-                MessageBoxW(hwnd, L"请输入正确的考试开始时间，格式为 YYYY-MM-DD HH:MM:SS。",
-                            L"时间格式有误", MB_OK | MB_ICONWARNING);
-                SetFocus(hEditStart);
-                SendMessageW(hEditStart, EM_SETSEL, 0, -1);
+                MessageBoxW(hwnd, L"请先在「考试日程」中添加至少一场考试，再启动监测。",
+                            L"没有可用的场次", MB_OK | MB_ICONINFORMATION);
+                SetFocus(hEditName);
+                return 0;
+            }
+
+            __int64 now = FtNow();
+            const __int64 minute = 60LL * 10000000LL;
+            const __int64 tolerance = 60LL * 10000000LL;
+
+            bool anyNode = false;
+            for (int i = 0; i < g_examCount && !anyNode; i++)
+            {
+                for (int k = 0; k < NODE_COUNT; k++)
+                {
+                    __int64 ft = g_exam[i].startFt + (__int64)kNodeOffsetMin[k] * minute;
+                    if (now - ft <= tolerance) { anyNode = true; break; }
+                }
+            }
+
+            if (!anyNode)
+            {
+                MessageBoxW(hwnd,
+                            L"日程中所有场次的打铃时间都已过去超过 60 秒。\r\n"
+                            L"请添加新的场次，或调整场次时间后再启动。",
+                            L"没有可触发的节点", MB_OK | MB_ICONWARNING);
                 return 0;
             }
 
             g_pendingStart = true;
-            g_pendingStartFt = startFt;
 
             EnableWindow(hBtnStart, FALSE);
             SetWindowTextW(hBtnStart, L"启动中…");
@@ -1567,21 +2242,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_synced && GetTickCount64() - g_lastSyncTick < 120000)
             {
                 g_pendingStart = false;
-
-                if (startFt <= FtNow())
-                {
-                    MessageBoxW(hwnd,
-                                (L"考试开始时间已经过去（当前北京时间 " + FormatTime(FtNow()) +
-                                 L"），请重新填写。").c_str(),
-                                L"时间无效", MB_OK | MB_ICONWARNING);
-
-                    EnableWindow(hBtnStart, TRUE);
-                    SetWindowTextW(hBtnStart, L"启 动 监 测");
-                    InvalidateRect(hBtnStart, NULL, TRUE);
-                    return 0;
-                }
-
-                StartMonitoring(startFt);
+                StartMonitoring();
                 return 0;
             }
 
@@ -1601,13 +2262,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
-        if (id == ID_FILL && code == BN_CLICKED)
+        if (id == ID_NOW30 && code == BN_CLICKED)
         {
-            FillStartFromClock();
+            SetDtpTime(FtFromNowMinutes(30));
             return 0;
         }
 
-        for (int i = 0; i < 3; i++)
+        if (id == ID_ADD_EXAM && code == BN_CLICKED)
+        {
+            AddExamFromInput();
+            return 0;
+        }
+
+        if (id == ID_DEL_EXAM && code == BN_CLICKED)
+        {
+            DeleteSelectedExam();
+            return 0;
+        }
+
+        if (id == ID_CLEAR_EXAM && code == BN_CLICKED)
+        {
+            ClearExams();
+            return 0;
+        }
+
+        if (id == ID_EXAM_LIST)
+        {
+            if (code == LBN_SELCHANGE)
+            {
+                int sel = (int)SendMessageW(hExamList, LB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel < g_examCount)
+                {
+                    g_selectedExam = sel;
+                    UpdateNodePanel();
+                }
+            }
+            return 0;
+        }
+
+        for (int i = 0; i < NODE_COUNT; i++)
         {
             if (id == ID_PICK0 + i && code == BN_CLICKED)
             {
@@ -1643,21 +2336,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_pendingStart)
         {
             g_pendingStart = false;
-
-            if (g_pendingStartFt <= FtNow())
-            {
-                MessageBoxW(hwnd,
-                            (L"考试开始时间已经过去（当前北京时间 " + FormatTime(FtNow()) +
-                             L"），请重新填写。").c_str(),
-                            L"时间无效", MB_OK | MB_ICONWARNING);
-
-                EnableWindow(hBtnStart, TRUE);
-                SetWindowTextW(hBtnStart, L"启 动 监 测");
-                InvalidateRect(hBtnStart, NULL, TRUE);
-                return 0;
-            }
-
-            StartMonitoring(g_pendingStartFt);
+            StartMonitoring();
         }
 
         return 0;
@@ -1731,7 +2410,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     ReleaseDC(NULL, screen);
     if (g_dpi <= 0) g_dpi = 96;
 
-    InitCommonControls();
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_DATE_CLASSES | ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
 
     RebaseClock();
 
@@ -1747,7 +2429,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     wc.lpszClassName = L"ExamBellWindow";
     RegisterClassExW(&wc);
 
-    RECT rc = { 0, 0, S(980), S(700) };
+    RECT rc = { 0, 0, S(1020), S(760) };
     AdjustWindowRectEx(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
 
     HWND hwnd = CreateWindowExW(0, L"ExamBellWindow", L"考试自动打铃",
@@ -1765,7 +2447,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
         if (g_audio[i].empty()) g_audio[i] = FindDefaultAudio(i);
         UpdateAudioLabel(i);
     }
-    UpdateAllNodeRows();
+    RefreshExamList();
+    UpdateCountdown();
 
     ShowWindow(hwnd, SW_SHOWNORMAL);
     CenterWindow(hwnd);
