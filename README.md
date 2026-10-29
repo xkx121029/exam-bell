@@ -2,6 +2,8 @@
 
 一个面向学校考务人员的 Windows 桌面小工具：填入考试开始时间，程序会按北京时间自动播放三段提示音频，无需人工守点。
 
+单文件 exe，**不依赖任何运行时**（不需要 .NET / VC++ 运行库），拷贝到 Win7 及以上的机器直接双击即可。
+
 ---
 
 ## 项目简介
@@ -12,7 +14,7 @@
 - 点击"启动监测"后，自动排好三个打铃节点；
 - 到点自动播放对应音频，全部结束后自动复位，可立即排下一场。
 
-程序不依赖第三方运行库，`dist\ExamBell.exe` 约 42 KB，拷贝即可运行。
+`dist\ExamBell.exe` 约 890 KB，静态链接，只调用系统自带 DLL，**零安装**。
 
 ---
 
@@ -36,13 +38,14 @@
 http://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp
 ```
 
-- 记录请求发出与收到响应的本地时间，按**往返时延取中值**，换算出北京时间与本地时间的偏移量；
-- 之后使用 `Stopwatch` 高精度计时器推算当前时间，**即使运行过程中系统时间被改动，也不影响打铃时刻**；
-- 网络不可用时，界面以红字提示，并自动回退到本机时间继续工作。
+- 记录请求发出与收到响应的本地时间，按**往返时延取中值**换算出北京时间与本地时间的偏移量；
+- 之后用 `GetTickCount64()` 单调递增的计时推算当前时间，**运行中系统时间被改动也不影响打铃时刻**；
+- 网络不可用时，界面以红字提示"未同步 · 使用本机时间"，自动回退到本机时钟继续工作；
+- 系统从休眠恢复时自动重新校时。
 
 ### 急停
 
-界面提供一块大面积红色按钮，也可直接按 `Esc`，立即停止正在播放的音频并取消全部后续节点。
+界面下半部分是一块大面积红色按钮，也可直接按 `Esc`，立即停止正在播放的音频并取消全部后续节点。
 
 ### 无人值守
 
@@ -75,8 +78,15 @@ http://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp
 ## 运行环境
 
 - 操作系统：Windows 7 SP1 x64（Windows 10 / 11 亦可正常运行）
-- 运行库：**.NET Framework 4.5 或更高版本**（Win10/11 已内置，Win7 需自行安装）
-- 无需第三方 DLL、无需管理员权限
+- 运行库：**无**。不依赖 .NET、VC++ 运行库或任何第三方 DLL
+- 依赖的系统组件：`KERNEL32 / USER32 / GDI32 / COMCTL32 / comdlg32 / WINHTTP / WINMM / msvcrt`（均为 Windows 自带）
+- 无需管理员权限
+
+可用如下命令核对依赖清单：
+
+```bash
+objdump -p dist/ExamBell.exe | grep "DLL Name"
+```
 
 ---
 
@@ -100,19 +110,19 @@ http://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp
 
 ## 源码构建
 
-### 方式一：命令行（推荐）
-
-需要 .NET SDK（工程通过 `Microsoft.NETFramework.ReferenceAssemblies` 提供 net45 引用程序集，因此无需安装完整 Visual Studio）：
+源码为单个 C++ 文件 [src-native/exambell.cpp](src-native/exambell.cpp)，只使用 Win32 API，不引入第三方库。使用 MinGW-w64 静态链接编译：
 
 ```bash
-dotnet build ExamBell.csproj -c Release -o dist
+# 1) 编译图标资源
+windres -I src-native -O coff -o res.o src-native/exambell.rc
+
+# 2) 静态链接生成 exe（产物无任何第三方运行时依赖）
+g++ -O2 -mwindows -municode -static -static-libgcc -static-libstdc++ \
+    -o dist/ExamBell.exe src-native/exambell.cpp res.o \
+    -lwinhttp -lwinmm -lcomctl32 -lgdi32 -luser32
 ```
 
-产物为 `dist\ExamBell.exe`。
-
-### 方式二：Visual Studio
-
-用 Visual Studio 2017 及以上版本直接打开 `ExamBell.csproj`，选择 Release 配置编译即可。
+产物为 `dist\ExamBell.exe`，可直接分发给任何 Win7 SP1 x64 及以上的机器。
 
 ---
 
@@ -130,7 +140,7 @@ audio2=D:\audio\begin.wav
 
 | 键 | 说明 |
 | --- | --- |
-| `start` | 考试开始时间，格式 `yyyy-MM-dd HH:mm:ss` |
+| `start` | 考试开始时间，格式 `YYYY-MM-DD HH:MM:SS` |
 | `audio0` | 第一段（考前 10 分钟）音频完整路径 |
 | `audio1` | 第二段（考前 5 分钟）音频完整路径 |
 | `audio2` | 第三段（考试开始）音频完整路径 |
@@ -148,32 +158,20 @@ audio\
 
 程序按 `01` / `02` / `03` 前缀依次对应三个节点。配置文件中的路径优先级高于自动识别结果。
 
-### 错误日志
-
-程序发生未捕获异常时，会写入：
-
-```
-%APPDATA%\ExamBell\error.log
-```
-
-反馈问题时请附上该文件内容。
-
 ---
 
 ## 目录结构
 
 ```
 exam-bell/
-├─ src/
-│  ├─ Program.cs        程序入口、全局异常捕获与日志写入
-│  ├─ MainForm.cs       全部界面与调度逻辑（节点排期、状态流转、急停、配置持久化）
-│  ├─ AudioPlayer.cs    MCI 音频播放器 + 北京标准时钟实现
-│  └─ NetworkClock.cs   网络校时（淘宝时间戳接口）
+├─ src-native/
+│  ├─ exambell.cpp      全部界面、调度、校时与音频播放（Win32 原生实现）
+│  ├─ exambell.rc       资源脚本（图标）
+│  └─ app.ico           应用图标
+├─ src/                 早期 .NET 实现（已弃用，仅作历史保留）
 ├─ dist/
-│  ├─ ExamBell.exe      编译产物，可直接运行
-│  └─ ExamBell.exe.config
+│  └─ ExamBell.exe      编译产物，可直接运行
 ├─ app.ico              应用图标
-├─ ExamBell.csproj      工程文件
 ├─ LICENSE              MIT 许可证
 └─ README.md
 ```
@@ -184,37 +182,29 @@ exam-bell/
 
 ### 1. 三段节点排期
 
-以考试开始时间为基准，分别计算 `start - 10min`、`start - 5min`、`start` 三个时刻，构建三个待触发节点。每个节点维护独立状态（待触发 / 已触发 / 已错过），监测循环按时间顺序推进。
+以考试开始时间为基准，分别计算 `start - 10min`、`start - 5min`、`start` 三个时刻，构建三个节点。每个节点维护独立状态（待触发 / 播放中 / 已完成 / 已错过 / 已取消），200 ms 定时器轮询推进。
 
 ### 2. 网络校时与高精度计时
 
-校时请求记录发出前与收到响应后的本地时间，得到往返时延 `roundTrip`，用响应时刻回退 `roundTrip / 2` 作为参考时刻，再计算与接口返回的北京时间之间的偏移量。校时成功后，以该偏移量加 `Stopwatch` 单调递增的时长推算当前时间：
+校时请求记录发出前与收到响应后的本地时间，得到往返时延，用响应时刻回退一半时延作为参考时刻，再与接口返回的北京时间比较得到偏移量。之后：
 
-```csharp
-Now = 基准本地时间 + Stopwatch.Elapsed + 偏移量
+```
+当前时间 = 基准本地时间 + GetTickCount64 经过时间 + 偏移量
 ```
 
-由于 `Stopwatch` 不随系统时间调整而跳变，运行中修改系统时间不会导致打铃提前或延后。休眠唤醒后通过 `Rebase` 重建计时基准并保留偏移量。校时失败时偏移量归零，回退本机时间。
+`GetTickCount64` 不随系统时间调整而跳变，因此运行中修改系统时间不会导致打铃提前或延后。校时失败时偏移量归零，按本机时钟继续工作。
 
 ### 3. 音频播放
 
-直接调用 `winmm.dll` 的 `mciSendString`，先按扩展名自动识别，失败再依次尝试 `mpegvideo`、`waveaudio` 设备类型。不引入任何第三方库，Win7 自带解码能力即可播放 WAV / MP3 / WMA。
+调用 `winmm.dll` 的 MCI（`mciSendString`），先按扩展名自动打开，失败再依次尝试 `mpegvideo`、`waveaudio` 设备类型。不引入任何第三方库，系统自带解码即可播放 WAV / MP3 / WMA。
 
 ### 4. 急停
 
-急停会停止当前 MCI 播放实例并关闭设备，同时将所有未触发节点标记为取消，监测循环立即退出。`Esc` 与急停按钮走同一入口。
+急停会停止当前 MCI 播放实例并关闭设备，同时把所有未触发节点标记为"已取消"，监测循环立即退出。`Esc` 与急停按钮走同一入口。
 
-### 5. 容差与补响
+### 5. 界面
 
-每次启动监测时，对已过期的节点判断迟到时长：不超过 60 秒的节点保持待触发状态，由监测循环在下一次轮询立即补响；超过 60 秒的节点标记为"已错过"，避免考试中途误响。
-
-### 6. 配置持久化
-
-退出或启动监测时写入 `config.ini`，读取时对损坏或缺失的配置静默回退默认值，保证打铃主流程不受配置文件影响。
-
-### 7. 健壮性
-
-入口处注册 `Application.ThreadException` 与启动异常捕获，任何未处理异常都会写入 `%APPDATA%\ExamBell\error.log` 并弹窗提示，不会静默退出。
+纯 Win32 原生控件（STATIC / EDIT / GROUPBOX），自绘按钮（`BS_OWNERDRAW` + `WM_DRAWITEM`），状态色块通过 `WM_CTLCOLORSTATIC` 上色。运行时读取屏幕 DPI 并按比例缩放全部坐标，高 DPI 下不糊不挤。
 
 ---
 
@@ -231,7 +221,7 @@ Now = 基准本地时间 + Stopwatch.Elapsed + 偏移量
 
 1. Fork 本仓库并新建分支；
 2. 保持改动聚焦，说明修改动机与影响范围；
-3. 提交前请在本机以 Release 配置编译通过，并实际运行验证打铃流程；
+3. 提交前请在本机编译通过，并实际运行验证打铃流程；
 4. 提交 PR 时描述复现步骤或使用场景。
 
 ---
@@ -250,12 +240,19 @@ Now = 基准本地时间 + Stopwatch.Elapsed + 偏移量
 
 ## 更新日志
 
+### 2026-10-29 · v1.1.0
+
+- 以 Win32 原生 C++ 重写，**移除 .NET 依赖**，单文件 exe 零安装运行；
+- 界面重排：顶部北京时间大时钟、日期与校时状态分区显示，修复文本重叠与重影；
+- 校时失败时时间基准改为本机时区（不再显示 UTC 偏差 8 小时）；
+- 窗口改为显示后居中，避免出现在屏幕外；
+- 静态链接，仅依赖 Windows 自带系统 DLL。
+
 ### 2026-10-29 · v1.0.0
 
 - 首次开源发布；
 - 三段自动打铃（考前 10 分钟 / 考前 5 分钟 / 考试开始）；
-- 基于网络校时与 `Stopwatch` 的北京时间基准；
+- 基于网络校时与单调计时器的北京时间基准；
 - 急停按钮与 `Esc` 快捷键；
 - 60 秒容差补响机制；
-- 配置持久化与 `audio` 目录自动识别；
-- 全局异常日志记录。
+- 配置持久化与 `audio` 目录自动识别。
