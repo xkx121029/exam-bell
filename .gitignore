@@ -1,0 +1,26 @@
+# 构建中间产物
+bin/
+obj/
+*.user
+*.suo
+*.pdb
+*.obj
+*.ilk
+*.log
+.vs/
+.vscode/
+.idea/
+
+# 发布产物中的调试文件（dist 目录本身保留，便于直接下载 exe）
+dist/*.pdb
+dist/*.xml
+dist/*.exp
+dist/*.lib
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 本地临时配置
+audio/
