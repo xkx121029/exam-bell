@@ -95,6 +95,7 @@ static __int64   g_offsetTicks = 0;
 static bool      g_synced = false;
 static bool      g_syncBusy = false;
 static __int64   g_lastOffsetMs = 0;
+static ULONGLONG g_lastSyncTick = 0;
 
 // 节点
 static __int64      g_nodeFt[3] = {0, 0, 0};
@@ -489,7 +490,175 @@ struct SyncResult
     __int64 offsetTicks;
     long roundTripMs;
     std::wstring message;
+    std::wstring source;
 };
+
+// 校时源类型：JSON 毫秒时间戳 / JSON 北京时间字符串 / HTTP Date 响应头
+enum SyncKind { SYNC_TAOBAO, SYNC_SUNING, SYNC_DATE_HEADER };
+
+struct TimeSource
+{
+    const wchar_t* host;
+    const wchar_t* path;
+    const wchar_t* name;
+    SyncKind kind;
+};
+
+// 依次尝试；任一可用即停止。淘宝接口在部分网络下 DNS 不可达，故备有苏宁与 Date 头兜底。
+static const TimeSource kTimeSources[] =
+{
+    { L"api.m.taobao.com", L"/rest/api3.do?api=mtop.common.getTimestamp", L"淘宝", SYNC_TAOBAO     },
+    { L"quan.suning.com",  L"/getSysTime.do",                             L"苏宁", SYNC_SUNING     },
+    { L"www.baidu.com",    L"/",                                          L"百度", SYNC_DATE_HEADER },
+};
+
+static bool ParseTaobaoTime(const std::string& body, __int64* serverFt)
+{
+    size_t pos = body.find("\"t\":\"");
+    if (pos == std::string::npos) return false;
+    pos += 5;
+
+    size_t end = pos;
+    while (end < body.size() && body[end] >= '0' && body[end] <= '9') end++;
+    if (end == pos) return false;
+
+    __int64 stamp = _strtoi64(body.substr(pos, end - pos).c_str(), NULL, 10);
+    if (stamp < 100000000000LL) stamp *= 1000;   // 秒 -> 毫秒
+
+    // 服务器时间戳为 UTC 毫秒，换算成北京时间对应的 FILETIME 数值
+    *serverFt = stamp * 10000LL + (__int64)8 * 3600 * 10000000LL;
+    return true;
+}
+
+static bool ParseSuningTime(const std::string& body, __int64* serverFt)
+{
+    size_t pos = body.find("\"sysTime2\":\"");
+    if (pos == std::string::npos) return false;
+    pos += 12;   // 跳过 "sysTime2":"
+
+    size_t end = body.find('"', pos);
+    if (end == std::string::npos) return false;
+
+    int y = 0, mo = 0, d = 0, hh = 0, mm = 0, ss = 0;
+    if (sscanf(body.substr(pos, end - pos).c_str(), "%d-%d-%d %d:%d:%d",
+               &y, &mo, &d, &hh, &mm, &ss) != 6)
+        return false;
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+
+    // 接口返回的就是北京时间墙上时间，直接作为基准
+    SYSTEMTIME st;
+    ZeroMemory(&st, sizeof(st));
+    st.wYear = (WORD)y; st.wMonth = (WORD)mo; st.wDay = (WORD)d;
+    st.wHour = (WORD)hh; st.wMinute = (WORD)mm; st.wSecond = (WORD)ss;
+    *serverFt = SystemTimeToFt(st);
+    return true;
+}
+
+// 拉取单个时间源，成功后输出"服务器当前的北京时间"与本次往返时延
+static bool FetchServerTime(const TimeSource& src, __int64* serverFt,
+                            __int64* afterFt, long* rttMs, std::wstring* err)
+{
+    HINTERNET session = WinHttpOpen(L"ExamBell/1.1",
+                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME,
+                                    WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session)
+    {
+        *err = L"无法初始化网络组件";
+        return false;
+    }
+
+    WinHttpSetTimeouts(session, 3000, 3000, 3000, 3000);
+
+    // 部分时间源会拒绝非浏览器 UA（直接返回 403），统一带上常规 UA
+    const wchar_t* ua = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        L"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+    WinHttpSetOption(session, WINHTTP_OPTION_USER_AGENT,
+                     (LPVOID)ua, (DWORD)((wcslen(ua) + 1) * sizeof(wchar_t)));
+
+    HINTERNET connect = WinHttpConnect(session, src.host, INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!connect)
+    {
+        *err = L"无法连接服务器";
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(connect, L"GET", src.path, NULL,
+                                           WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!request)
+    {
+        *err = L"无法创建请求";
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    __int64 before = LocalFtNow();
+
+    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(request, NULL);
+
+    bool parsed = false;
+    __int64 after = before;
+
+    if (ok)
+    {
+        if (src.kind == SYNC_DATE_HEADER)
+        {
+            // 任意站点的 Date 头都是服务器 UTC 时间，精度到秒
+            SYSTEMTIME st;
+            ZeroMemory(&st, sizeof(st));
+            DWORD size = sizeof(st);
+            if (WinHttpQueryHeaders(request,
+                                    WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &st, &size,
+                                    WINHTTP_NO_HEADER_INDEX) && st.wYear >= 1970)
+            {
+                *serverFt = SystemTimeToFt(st) + (__int64)8 * 3600 * 10000000LL;
+                parsed = true;
+            }
+            after = LocalFtNow();
+        }
+        else
+        {
+            std::string body;
+            for (;;)
+            {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(request, &avail)) break;
+                if (avail == 0) break;
+                if (avail > 65536) avail = 65536;
+
+                std::string chunk(avail, '\0');
+                DWORD read = 0;
+                if (!WinHttpReadData(request, &chunk[0], avail, &read)) break;
+                if (read == 0) break;
+
+                chunk.resize(read);
+                body += chunk;
+                if (body.size() > 262144) break;
+            }
+            after = LocalFtNow();
+
+            if (src.kind == SYNC_TAOBAO) parsed = ParseTaobaoTime(body, serverFt);
+            else                          parsed = ParseSuningTime(body, serverFt);
+        }
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    *afterFt = after;
+    *rttMs = (long)((after - before) / 10000LL);
+
+    if (!ok)      { *err = L"连接失败（网络不可达或被拦截）"; return false; }
+    if (!parsed)  { *err = L"返回内容中没有可识别的时间字段"; return false; }
+    return true;
+}
 
 static SyncResult* DoSyncRequest()
 {
@@ -498,110 +667,37 @@ static SyncResult* DoSyncRequest()
     result->offsetTicks = 0;
     result->roundTripMs = 0;
 
-    const wchar_t* host = L"api.m.taobao.com";
-    const wchar_t* path = L"/rest/api3.do?api=mtop.common.getTimestamp";
+    int count = (int)(sizeof(kTimeSources) / sizeof(kTimeSources[0]));
+    std::wstring lastErr;
 
-    HINTERNET session = WinHttpOpen(L"ExamBell/1.0",
-                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME,
-                                    WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session)
+    for (int i = 0; i < count && !result->ok; i++)
     {
-        result->message = L"无法初始化网络组件";
-        return result;
-    }
+        __int64 serverFt = 0;
+        __int64 afterFt = 0;
+        long rtt = 0;
+        std::wstring err;
 
-    WinHttpSetTimeouts(session, 3000, 3000, 3000, 3000);
-
-    __int64 before = LocalFtNow();
-
-    HINTERNET connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTP_PORT, 0);
-    if (!connect)
-    {
-        result->message = L"无法连接校时服务器（网络未连接或被拦截）";
-        WinHttpCloseHandle(session);
-        return result;
-    }
-
-    HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, NULL,
-                                           WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-    if (!request)
-    {
-        result->message = L"无法创建校时请求";
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        return result;
-    }
-
-    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (ok) ok = WinHttpReceiveResponse(request, NULL);
-
-    std::string body;
-    if (ok)
-    {
-        DWORD avail = 0;
-        for (;;)
+        if (!FetchServerTime(kTimeSources[i], &serverFt, &afterFt, &rtt, &err))
         {
-            avail = 0;
-            if (!WinHttpQueryDataAvailable(request, &avail)) break;
-            if (avail == 0) break;
-            if (avail > 65536) avail = 65536;
-
-            std::string chunk(avail, '\0');
-            DWORD read = 0;
-            if (!WinHttpReadData(request, &chunk[0], avail, &read)) break;
-            if (read == 0) break;
-
-            chunk.resize(read);
-            body += chunk;
+            lastErr = err;
+            continue;
         }
+
+        // 往返时延取中值作为基准时刻
+        __int64 reference = afterFt - (__int64)rtt * 10000LL / 2;
+
+        result->offsetTicks = serverFt - reference;
+        result->roundTripMs = rtt;
+        result->source = kTimeSources[i].name;
+        result->ok = true;
     }
 
-    __int64 after = LocalFtNow();
-
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-
-    result->roundTripMs = (long)((after - before) / 10000LL);
-
-    if (!ok || body.empty())
+    if (!result->ok)
     {
-        result->message = L"连接校时服务器失败";
-        return result;
+        result->message = L"所有时间源均不可达（未联网或被防火墙拦截）";
+        if (!lastErr.empty()) result->message += L"：" + lastErr;
     }
 
-    size_t pos = body.find("\"t\":\"");
-    if (pos == std::string::npos)
-    {
-        result->message = L"校时接口返回内容中没有时间戳字段";
-        return result;
-    }
-    pos += 5;
-
-    size_t end = pos;
-    while (end < body.size() && body[end] >= '0' && body[end] <= '9') end++;
-    if (end == pos)
-    {
-        result->message = L"校时接口返回的时间戳格式无法识别";
-        return result;
-    }
-
-    std::string digits = body.substr(pos, end - pos);
-    __int64 stamp = _strtoi64(digits.c_str(), NULL, 10);
-    if (stamp < 100000000000LL) stamp *= 1000;
-
-    // 服务器时间戳为 UTC 毫秒，换算成北京时间对应的 FILETIME
-    __int64 beijingFt = stamp * 10000LL + (__int64)8 * 3600 * 10000000LL;
-
-    // 往返时延取中值作为基准时刻
-    __int64 roundTripTicks = after - before;
-    __int64 reference = after - roundTripTicks / 2;
-
-    result->offsetTicks = beijingFt - reference;
-    result->ok = true;
     return result;
 }
 
@@ -803,7 +899,6 @@ static void BuildUi()
     // 底部操作
     hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 572, 300, 112, &biPrimary, fStart, ID_START);
     hBtnStop  = MakeOwnedButton(L"急  停", 334, 572, 626, 112, &biDanger, fStop, ID_STOP);
-    EnableWindow(hBtnStop, FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -963,13 +1058,12 @@ static void CheckAllFinished()
     if (!g_running) return;
 
     g_running = false;
-    EnableWindow(hBtnStop, FALSE);
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
     EnableWindow(hEditStart, TRUE);
 
-    Log(L"本轮打铃任务已全部结束，可再次启动下一场");
+    Log(L"本轮任务全部结束，可安排下一场");
     UpdateCountdown();
 }
 
@@ -1081,10 +1175,9 @@ static void StartMonitoring(__int64 startFt)
     EnableWindow(hBtnStart, FALSE);
     SetWindowTextW(hBtnStart, L"运 行 中");
     InvalidateRect(hBtnStart, NULL, TRUE);
-    EnableWindow(hBtnStop, TRUE);
     EnableWindow(hEditStart, FALSE);
 
-    Log(L"开始监测：考试开始时间 " + FormatDateTime(startFt) + L"（北京时间）");
+    Log(L"开始监测 · 考试开始 " + FormatTime(startFt));
 
     UpdateAllNodeRows();
     UpdateCountdown();
@@ -1093,7 +1186,11 @@ static void StartMonitoring(__int64 startFt)
 
 static void PerformEmergencyStop()
 {
-    if (!g_running) return;
+    if (!g_running)
+    {
+        Log(L"急停：当前没有正在进行的监测任务");
+        return;
+    }
 
     MciStop();
     MciClose();
@@ -1110,13 +1207,12 @@ static void PerformEmergencyStop()
     g_running = false;
     g_stoppedByUser = true;
 
-    EnableWindow(hBtnStop, FALSE);
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
     EnableWindow(hEditStart, TRUE);
 
-    Log(L"【急停】已立即停止播放，并取消全部后续打铃任务");
+    Log(L"【急停】已停止播放并取消后续任务");
 
     UpdateAllNodeRows();
     UpdateCountdown();
@@ -1323,22 +1419,23 @@ static void ApplySyncResult(SyncResult* result)
         RebaseClock();
         g_offsetTicks = result->offsetTicks;
         g_synced = true;
+        g_lastSyncTick = GetTickCount64();
         g_lastOffsetMs = result->offsetTicks / 10000LL;
 
         wchar_t buf[64];
         if (g_lastOffsetMs > 0)
         {
-            swprintf(buf, 64, L"已同步 · 偏差 +%lld ms", (long long)g_lastOffsetMs);
+            swprintf(buf, 64, L"已同步（%ls）· 偏差 +%lld ms", result->source.c_str(), (long long)g_lastOffsetMs);
         }
         else
         {
-            swprintf(buf, 64, L"已同步 · 偏差 %lld ms", (long long)g_lastOffsetMs);
+            swprintf(buf, 64, L"已同步（%ls）· 偏差 %lld ms", result->source.c_str(), (long long)g_lastOffsetMs);
         }
         SetWindowTextW(hSync, buf);
         g_syncTextColor = C_OKTXT;
 
-        Log(L"校时成功：北京时间 " + FormatDateTime(FtNow()) +
-            L"，往返时延 " + std::to_wstring(result->roundTripMs) + L" ms");
+        Log(L"校时成功（" + result->source + L"）：" + FormatTime(FtNow()) +
+            L"，时延 " + std::to_wstring(result->roundTripMs) + L" ms");
 
         FillDefaultStartIfEmpty();
         return;
@@ -1465,6 +1562,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             EnableWindow(hBtnStart, FALSE);
             SetWindowTextW(hBtnStart, L"启动中…");
             InvalidateRect(hBtnStart, NULL, TRUE);
+
+            // 刚校时成功过（2 分钟内）则直接启动，避免对同一时间源连发请求被限流
+            if (g_synced && GetTickCount64() - g_lastSyncTick < 120000)
+            {
+                g_pendingStart = false;
+
+                if (startFt <= FtNow())
+                {
+                    MessageBoxW(hwnd,
+                                (L"考试开始时间已经过去（当前北京时间 " + FormatTime(FtNow()) +
+                                 L"），请重新填写。").c_str(),
+                                L"时间无效", MB_OK | MB_ICONWARNING);
+
+                    EnableWindow(hBtnStart, TRUE);
+                    SetWindowTextW(hBtnStart, L"启 动 监 测");
+                    InvalidateRect(hBtnStart, NULL, TRUE);
+                    return 0;
+                }
+
+                StartMonitoring(startFt);
+                return 0;
+            }
 
             StartSyncThread();
             return 0;
