@@ -20,11 +20,13 @@
 // ---------------------------------------------------------------------------
 // 配色
 // ---------------------------------------------------------------------------
-static const COLORREF C_BG       = RGB(245, 246, 248);
+static const COLORREF C_BG       = RGB(246, 247, 249);
 static const COLORREF C_SURFACE  = RGB(255, 255, 255);
-static const COLORREF C_INK      = RGB(24, 27, 31);
-static const COLORREF C_MUTED    = RGB(108, 116, 128);
-static const COLORREF C_LINE     = RGB(224, 227, 233);
+static const COLORREF C_INK      = RGB(23, 26, 31);
+static const COLORREF C_MUTED    = RGB(110, 118, 130);
+static const COLORREF C_FAINT    = RGB(152, 159, 169);
+static const COLORREF C_LINE     = RGB(226, 229, 234);
+static const COLORREF C_HAIR     = RGB(240, 242, 245);
 static const COLORREF C_GREEN    = RGB(22, 105, 74);
 static const COLORREF C_GREEN_H  = RGB(28, 122, 88);
 static const COLORREF C_GREEN_P  = RGB(18, 86, 60);
@@ -103,17 +105,21 @@ static HWND hBtnStart = NULL, hBtnStop = NULL, hFootHint = NULL;
 // 卡片区域（逻辑坐标）
 struct CardRect { int x, y, w, h; };
 
-static const CardRect kCardExam  = { 20, 116, 640, 314 };   // 考试日程
-static const CardRect kCardNode  = { 20, 442, 640, 230 };   // 打铃节点
-static const CardRect kCardAudio = { 676, 116, 324, 200 };  // 音频文件
-static const CardRect kCardLog   = { 676, 328, 324, 344 };  // 运行日志
+static const CardRect kCardExam  = { 20, 92, 640, 306 };    // 考试日程
+static const CardRect kCardNode  = { 20, 406, 640, 230 };   // 打铃节点
+static const CardRect kCardAudio = { 676, 92, 324, 196 };   // 音频文件
+static const CardRect kCardLog   = { 676, 296, 324, 340 };  // 运行日志
+
+static const int kHeaderH = 84;
+static const int kFooterY = 668;
 
 static BtnInfo biTool, biPrimary, biDanger;
 
 static COLORREF g_syncTextColor = C_MUTED;
-static COLORREF g_countColor = C_MUTED;
+// 顶部运行状态：0 待启动 / 1 运行中 / 2 临近 1 分钟 / 3 已完成 / 4 已急停
+static int      g_runChip = 0;
 
-static HFONT fTitle, fSub, fClock, fDate, fSync, fCount, fCap, fEdit, fRow, fState, fHint, fLog, fBtnTool, fStart, fStop;
+static HFONT fTitle, fSub, fClock, fDate, fSync, fCap, fEdit, fRow, fState, fHint, fLog, fBtnTool, fStart, fStop;
 
 // 时钟基准
 static __int64   g_baseLocalFt = 0;
@@ -151,7 +157,7 @@ static bool g_pendingStart = false;
 static bool g_mciOpen = false;
 
 // 刷子
-static HBRUSH bBg, bSurface, bLine, bEdit, bSel;
+static HBRUSH bBg, bSurface, bLine, bEdit, bSel, bLog;
 static HBRUSH bStatePend, bStatePlay, bStateDone, bStateMiss, bStateCanc, bDisabledBg;
 
 // ---------------------------------------------------------------------------
@@ -948,6 +954,50 @@ static HWND MakeChip(const wchar_t* text, int x, int y, int w, int h, HFONT font
 }
 
 static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
+                            BtnInfo* info, HFONT font, int id);
+
+// 记录当前鼠标悬停的自绘按钮，用于 hover 着色
+static HWND    g_hotBtn  = NULL;
+static WNDPROC g_btnProc = NULL;
+
+static LRESULT CALLBACK ButtonHoverProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg)
+    {
+    case WM_MOUSEMOVE:
+        if (g_hotBtn != h && IsWindowEnabled(h))
+        {
+            HWND prev = g_hotBtn;
+            g_hotBtn = h;
+            if (prev) InvalidateRect(prev, NULL, FALSE);
+            InvalidateRect(h, NULL, FALSE);
+
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = h;
+            tme.dwHoverTime = 0;
+            TrackMouseEvent(&tme);
+        }
+        break;
+
+    case WM_MOUSELEAVE:
+        if (g_hotBtn == h)
+        {
+            g_hotBtn = NULL;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        break;
+
+    case WM_NCDESTROY:
+        if (g_hotBtn == h) g_hotBtn = NULL;
+        break;
+    }
+
+    return CallWindowProcW(g_btnProc, h, msg, w, l);
+}
+
+static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
                             BtnInfo* info, HFONT font, int id)
 {
     HWND b = CreateWindowExW(0, L"BUTTON", text,
@@ -956,10 +1006,13 @@ static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
                              g_hwnd, (HMENU)(INT_PTR)id, NULL, NULL);
     SendMessageW(b, WM_SETFONT, (WPARAM)font, TRUE);
     SetWindowLongPtrW(b, GWLP_USERDATA, (LONG_PTR)info);
+
+    if (!g_btnProc) g_btnProc = (WNDPROC)GetWindowLongPtrW(b, GWLP_WNDPROC);
+    SetWindowLongPtrW(b, GWLP_WNDPROC, (LONG_PTR)ButtonHoverProc);
     return b;
 }
 
-// 卡片：圆角白底 + 1px 边线 + 左上角标题
+// 面板：白底 + 1px 边线 + 标题行 + 标题下分隔线（贴近桌面生产力软件的密集信息面板）
 static void DrawCard(HDC dc, const CardRect& card, const wchar_t* title)
 {
     RECT r;
@@ -968,33 +1021,32 @@ static void DrawCard(HDC dc, const CardRect& card, const wchar_t* title)
     r.right = S(card.x + card.w);
     r.bottom = S(card.y + card.h);
 
-    // 轻微投影
-    RECT shadow = r;
-    OffsetRect(&shadow, 0, S(1));
-    HBRUSH shadowBrush = CreateSolidBrush(RGB(232, 235, 240));
-    HGDIOBJ ob = SelectObject(dc, shadowBrush);
-    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
-    RoundRect(dc, shadow.left, shadow.top, shadow.right, shadow.bottom, S(12), S(12));
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(shadowBrush);
-
     HBRUSH brush = CreateSolidBrush(C_SURFACE);
     HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
     HGDIOBJ b0 = SelectObject(dc, brush);
     HGDIOBJ p0 = SelectObject(dc, pen);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(12), S(12));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(10), S(10));
     SelectObject(dc, p0);
     SelectObject(dc, b0);
     DeleteObject(pen);
     DeleteObject(brush);
 
+    // 标题
     HGDIOBJ oldFont = SelectObject(dc, fCap);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, C_INK);
+    SetTextColor(dc, C_MUTED);
 
-    RECT tr = { r.left + S(14), r.top + S(10), r.right - S(14), r.top + S(34) };
+    RECT tr = { r.left + S(14), r.top + S(9), r.right - S(14), r.top + S(31) };
     DrawTextW(dc, title, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // 标题下细线
+    HPEN hair = CreatePen(PS_SOLID, 1, C_HAIR);
+    HGDIOBJ hp = SelectObject(dc, hair);
+    MoveToEx(dc, r.left + S(1), r.top + S(34), NULL);
+    LineTo(dc, r.right - S(1), r.top + S(34));
+    SelectObject(dc, hp);
+    DeleteObject(hair);
+
     SelectObject(dc, oldFont);
 }
 
@@ -1845,12 +1897,11 @@ static LRESULT CALLBACK TimePickProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 static void BuildUi()
 {
     // 字体
-    fTitle   = MakeFont(185, true);
+    fTitle   = MakeFont(155, true);
     fSub     = MakeFont(85,  false);
-    fClock   = MakeFont(200, true);
+    fClock   = MakeFont(190, true);
     fDate    = MakeFont(85,  false);
     fSync    = MakeFont(85,  false);
-    fCount   = MakeFont(115, true);
     fCap     = MakeFont(95,  true);
     fEdit    = MakeFont(105, false);
     fRow     = MakeFont(95,  false);
@@ -1867,6 +1918,7 @@ static void BuildUi()
     bLine       = CreateSolidBrush(C_LINE);
     bEdit       = CreateSolidBrush(C_SURFACE);
     bSel        = CreateSolidBrush(RGB(234, 243, 238));
+    bLog        = CreateSolidBrush(RGB(250, 251, 252));
     bStatePend  = CreateSolidBrush(C_ST_PEND_BG);
     bStatePlay  = CreateSolidBrush(C_ST_PLAY_BG);
     bStateDone  = CreateSolidBrush(C_ST_DONE_BG);
@@ -1890,22 +1942,22 @@ static void BuildUi()
     biDanger.hover   = C_RED_H;
     biDanger.pressed = C_RED_P;
 
-    // 顶部
-    hTitle    = MakeStatic(L"考试自动打铃", 24, 10, 320, 40, fTitle, SS_LEFT);
-    hSubtitle = MakeStatic(L"多场考试 · 北京时间基准 · 三段音频自动播放", 26, 49, 500, 22, fSub, SS_LEFT);
-    hCountdown = MakeStatic(L"待启动", 26, 72, 430, 26, fCount, SS_LEFT);
+    // 顶部：左侧标题与运行状态同排，副标题在下方；右侧时钟与校时
+    hTitle     = MakeStatic(L"考试自动打铃", 22, 10, 200, 30, fTitle, SS_LEFT);
+    hCountdown = MakeChip(L"待启动", 232, 13, 170, 26, fState);
+    hSubtitle  = MakeStatic(L"多场考试 · 北京时间基准 · 三段音频自动播放", 24, 46, 520, 20, fSub, SS_LEFT);
 
-    hClock = MakeStatic(L"--:--:--", 600, 4, 400, 44, fClock, SS_RIGHT);
-    hDate  = MakeStatic(L"北京时间", 620, 50, 380, 20, fDate, SS_RIGHT);
-    hSync  = MakeStatic(L"正在校时…", 620, 72, 272, 22, fSync, SS_RIGHT);
-    hBtnSync = MakeOwnedButton(L"重新校时", 900, 68, 100, 28, &biTool, fBtnTool, ID_SYNC);
+    hClock = MakeStatic(L"--:--:--", 596, 2, 404, 38, fClock, SS_RIGHT);
+    hDate  = MakeStatic(L"北京时间", 616, 41, 384, 18, fDate, SS_RIGHT);
+    hSync  = MakeStatic(L"正在校时…", 616, 59, 264, 18, fSync, SS_RIGHT);
+    hBtnSync = MakeOwnedButton(L"重新校时", 888, 54, 112, 26, &biTool, fBtnTool, ID_SYNC);
 
     // ------------------------------------------------------------------
     // 考试日程
     // ------------------------------------------------------------------
     hEditName = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
-                                S(kCardExam.x + 14), S(kCardExam.y + 40), S(180), S(30),
+                                S(kCardExam.x + 14), S(kCardExam.y + 38), S(180), S(30),
                                 g_hwnd, (HMENU)ID_EDIT_NAME, NULL, NULL);
     SendMessageW(hEditName, WM_SETFONT, (WPARAM)fEdit, TRUE);
     SendMessageW(hEditName, EM_SETLIMITTEXT, 40, 0);
@@ -1915,44 +1967,44 @@ static void BuildUi()
 
     hTimePick = CreateWindowExW(0, L"EBTimePick", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                S(kCardExam.x + 202), S(kCardExam.y + 40), S(288), S(30),
+                                S(kCardExam.x + 202), S(kCardExam.y + 38), S(288), S(30),
                                 g_hwnd, (HMENU)ID_TIME_PICK, NULL, NULL);
     SendMessageW(hTimePick, WM_SETFONT, (WPARAM)fEdit, TRUE);
     SetPickTime(FtFromNowMinutes(30));
 
-    hBtnAdd = MakeOwnedButton(L"添加到日程", kCardExam.x + 498, kCardExam.y + 40, 114, 30,
+    hBtnAdd = MakeOwnedButton(L"添加到日程", kCardExam.x + 498, kCardExam.y + 38, 114, 30,
                               &biPrimary, fBtnTool, ID_ADD_EXAM);
 
     hSetHint = MakeStatic(L"点日历图标选日期，点数字段后用滚轮或右侧箭头微调；启动监测后仍可继续添加",
-                          kCardExam.x + 14, kCardExam.y + 74, 600, 20, fHint, SS_LEFT);
+                          kCardExam.x + 14, kCardExam.y + 72, 600, 18, fHint, SS_LEFT);
 
     hExamList = CreateWindowExW(0, L"LISTBOX", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                                 LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-                                S(kCardExam.x + 14), S(kCardExam.y + 98), S(612), S(156),
+                                S(kCardExam.x + 14), S(kCardExam.y + 96), S(612), S(152),
                                 g_hwnd, (HMENU)ID_EXAM_LIST, NULL, NULL);
     SendMessageW(hExamList, WM_SETFONT, (WPARAM)fRow, TRUE);
     SendMessageW(hExamList, LB_SETITEMHEIGHT, 0, (LPARAM)S(48));
 
-    hBtnDel   = MakeOwnedButton(L"删除选中", kCardExam.x + 14, kCardExam.y + 264, 100, 30, &biTool, fBtnTool, ID_DEL_EXAM);
-    hBtnClear = MakeOwnedButton(L"清空日程", kCardExam.x + 122, kCardExam.y + 264, 88, 30, &biTool, fBtnTool, ID_CLEAR_EXAM);
-    hExamCount = MakeStatic(L"共 0 场", kCardExam.x + 400, kCardExam.y + 269, 226, 24, fState, SS_RIGHT);
+    hBtnDel   = MakeOwnedButton(L"删除选中", kCardExam.x + 14, kCardExam.y + 258, 100, 30, &biTool, fBtnTool, ID_DEL_EXAM);
+    hBtnClear = MakeOwnedButton(L"清空日程", kCardExam.x + 122, kCardExam.y + 258, 88, 30, &biTool, fBtnTool, ID_CLEAR_EXAM);
+    hExamCount = MakeStatic(L"共 0 场", kCardExam.x + 400, kCardExam.y + 9, 226, 18, fState, SS_RIGHT);
 
     // ------------------------------------------------------------------
     // 打铃节点
     // ------------------------------------------------------------------
-    hNodeTitle = MakeStatic(L"未选择场次", kCardNode.x + 180, kCardNode.y + 12, 446, 22, fState, SS_RIGHT);
+    hNodeTitle = MakeStatic(L"未选择场次", kCardNode.x + 180, kCardNode.y + 12, 446, 20, fState, SS_RIGHT);
 
-    MakeStatic(L"节点", kCardNode.x + 14, kCardNode.y + 42, 200, 20, fState, SS_LEFT);
-    MakeStatic(L"预定时间", kCardNode.x + 336, kCardNode.y + 42, 130, 20, fState, SS_LEFT);
-    MakeStatic(L"状态", kCardNode.x + 484, kCardNode.y + 42, 110, 20, fState, SS_LEFT);
+    MakeStatic(L"节点", kCardNode.x + 14, kCardNode.y + 42, 200, 18, fState, SS_LEFT);
+    MakeStatic(L"预定时间", kCardNode.x + 336, kCardNode.y + 42, 130, 18, fState, SS_LEFT);
+    MakeStatic(L"状态", kCardNode.x + 484, kCardNode.y + 42, 110, 18, fState, SS_LEFT);
 
     for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = kCardNode.y + 70 + i * 48;
-        hNodeName[i]  = MakeStatic(kNodeName[i], kCardNode.x + 14, y, 310, 26, fRow, SS_LEFT);
-        hNodeTime[i]  = MakeStatic(L"—", kCardNode.x + 336, y, 130, 26, fRow, SS_LEFT);
-        hNodeState[i] = MakeChip(L"未排期", kCardNode.x + 480, y + 1, 120, 24, fState);
+        int y = kCardNode.y + 72 + i * 50;
+        hNodeName[i]  = MakeStatic(kNodeName[i], kCardNode.x + 14, y, 310, 24, fRow, SS_LEFT);
+        hNodeTime[i]  = MakeStatic(L"—", kCardNode.x + 336, y, 130, 24, fRow, SS_LEFT);
+        hNodeState[i] = MakeChip(L"未排期", kCardNode.x + 480, y, 120, 24, fState);
     }
 
     // ------------------------------------------------------------------
@@ -1960,16 +2012,16 @@ static void BuildUi()
     // ------------------------------------------------------------------
     for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = kCardAudio.y + 44 + i * 50;
+        int y = kCardAudio.y + 42 + i * 50;
 
         // 左侧上下两行：节点名 + 文件名
-        hAudioCap[i]  = MakeStatic(kNodeShort[i], kCardAudio.x + 14, y, 96, 22, fRow, SS_LEFT);
-        hAudioFile[i] = MakeStatic(L"未选择", kCardAudio.x + 14, y + 21, 180, 20,
+        hAudioCap[i]  = MakeStatic(kNodeShort[i], kCardAudio.x + 14, y, 96, 20, fRow, SS_LEFT);
+        hAudioFile[i] = MakeStatic(L"未选择", kCardAudio.x + 14, y + 20, 180, 18,
                                    fState, SS_LEFT | SS_ENDELLIPSIS);
 
         // 右侧两个按钮
-        hBtnPick[i] = MakeOwnedButton(L"选择", kCardAudio.x + 202, y + 8, 50, 26, &biTool, fBtnTool, ID_PICK0 + i);
-        hBtnPlay[i] = MakeOwnedButton(L"试听", kCardAudio.x + 258, y + 8, 50, 26, &biTool, fBtnTool, ID_PLAY0 + i);
+        hBtnPick[i] = MakeOwnedButton(L"选择", kCardAudio.x + 202, y + 7, 50, 26, &biTool, fBtnTool, ID_PICK0 + i);
+        hBtnPlay[i] = MakeOwnedButton(L"试听", kCardAudio.x + 258, y + 7, 50, 26, &biTool, fBtnTool, ID_PLAY0 + i);
     }
 
     // ------------------------------------------------------------------
@@ -1977,14 +2029,14 @@ static void BuildUi()
     // ------------------------------------------------------------------
     hLog = CreateWindowExW(0, L"EDIT", L"",
                            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
-                           S(kCardLog.x + 14), S(kCardLog.y + 44), S(296), S(286),
+                           S(kCardLog.x + 14), S(kCardLog.y + 40), S(296), S(286),
                            g_hwnd, (HMENU)ID_LOG, NULL, NULL);
     SendMessageW(hLog, WM_SETFONT, (WPARAM)fLog, TRUE);
 
-    // 底部操作
-    hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 690, 300, 56, &biPrimary, fStart, ID_START);
-    hBtnStop  = MakeOwnedButton(L"急  停", 336, 690, 300, 56, &biDanger, fStop, ID_STOP);
-    hFootHint = MakeStatic(L"按 Esc 亦可急停", 652, 706, 348, 24, fHint, SS_RIGHT);
+    // 底部操作条：主操作靠左，急停靠右，形成清晰的主次层级
+    hBtnStart = MakeOwnedButton(L"启动监测", 20, 684, 240, 48, &biPrimary, fStart, ID_START);
+    hBtnStop  = MakeOwnedButton(L"急停", 856, 684, 144, 48, &biDanger, fStop, ID_STOP);
+    hFootHint = MakeStatic(L"按 Esc 亦可急停", 272, 697, 572, 22, fHint, SS_LEFT);
 }
 
 // ---------------------------------------------------------------------------
@@ -2119,11 +2171,11 @@ static void UpdateAudioLabel(int index)
     {
         if (g_audio[index].empty())
         {
-            SetWindowTextW(hAudioFile[index], L"未选择（点击“选择”添加）");
+            SetWindowTextW(hAudioFile[index], L"未选择");
         }
         else
         {
-            SetWindowTextW(hAudioFile[index], (L"文件已丢失：" + FileNameOf(g_audio[index])).c_str());
+            SetWindowTextW(hAudioFile[index], (L"缺失：" + FileNameOf(g_audio[index])).c_str());
         }
     }
     else
@@ -2155,6 +2207,7 @@ static void RefreshExamList()
         if (g_selectedExam >= 0) SendMessageW(hExamList, LB_SETCURSEL, 0, 0);
     }
 
+    // 场次数展示在标题行右侧
     wchar_t buf[64];
     swprintf(buf, 64, L"共 %d 场%s", g_examCount,
              g_examCount == 0 ? L" · 请先添加" : L"");
@@ -2176,6 +2229,8 @@ static void RefreshExamList()
 
 static void UpdateCountdown()
 {
+    std::wstring text;
+
     if (g_running)
     {
         int bestExam = -1, bestKind = -1;
@@ -2194,8 +2249,8 @@ static void UpdateCountdown()
 
         if (bestExam < 0)
         {
-            SetWindowTextW(hCountdown, L"本轮任务已完成");
-            g_countColor = C_OKTXT;
+            text = L"本轮已完成";
+            g_runChip = 3;
         }
         else
         {
@@ -2216,22 +2271,54 @@ static void UpdateCountdown()
             {
                 swprintf(buf, 64, L"距下一铃 %02d:%02d", minutes, seconds);
             }
-            SetWindowTextW(hCountdown, buf);
-            g_countColor = (totalSeconds <= 60) ? C_BADTXT : C_GREEN;
+            text = buf;
+            g_runChip = (totalSeconds <= 60) ? 2 : 1;
         }
     }
     else if (g_stoppedByUser)
     {
-        SetWindowTextW(hCountdown, L"已急停 · 后续任务已取消");
-        g_countColor = C_BADTXT;
+        text = L"已急停";
+        g_runChip = 4;
     }
     else
     {
-        SetWindowTextW(hCountdown, L"待启动");
-        g_countColor = C_MUTED;
+        text = L"待启动";
+        g_runChip = 0;
     }
 
-    InvalidateRect(hCountdown, NULL, TRUE);
+    // 仅在文案或配色变化时重绘，空闲时几乎不产生绘制
+    static std::wstring lastCountText;
+    static int lastRunChip = -1;
+    if (lastCountText != text || lastRunChip != g_runChip)
+    {
+        lastCountText = text;
+        lastRunChip = g_runChip;
+        SetWindowTextW(hCountdown, text.c_str());
+
+        // 胶囊宽度跟随文案，避免短文案拖着一条长底
+        if (hCountdown && fState)
+        {
+            HDC dc = GetDC(hCountdown);
+            HGDIOBJ old = SelectObject(dc, fState);
+            SIZE sz = {0, 0};
+            GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
+            SelectObject(dc, old);
+            ReleaseDC(hCountdown, dc);
+
+            int w = S(26) + S(7) + sz.cx + S(14);
+            if (w < S(96)) w = S(96);
+
+            RECT rc;
+            GetWindowRect(hCountdown, &rc);
+            POINT tl = { rc.left, rc.top };
+            ScreenToClient(g_hwnd, &tl);
+
+            SetWindowPos(hCountdown, NULL, tl.x, tl.y, w, S(26),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        InvalidateRect(hCountdown, NULL, TRUE);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2285,6 +2372,9 @@ static void TriggerBell(int exam, int kind)
     UpdateAllNodeRows();
 }
 
+// 空闲时降低轮询频率（1s），监测中保持 200ms，兼顾精度与功耗
+static void ApplyTimerMode();
+
 static void CheckAllFinished()
 {
     for (int i = 0; i < g_examCount; i++)
@@ -2299,7 +2389,7 @@ static void CheckAllFinished()
 
     g_running = false;
     EnableWindow(hBtnStart, TRUE);
-    SetWindowTextW(hBtnStart, L"启 动 监 测");
+    SetWindowTextW(hBtnStart, L"启动监测");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
     EnableWindow(hBtnDel, g_examCount > 0);
@@ -2307,6 +2397,7 @@ static void CheckAllFinished()
 
     Log(L"全部场次任务已结束，可继续添加或重新启动");
     UpdateCountdown();
+    ApplyTimerMode();
 }
 
 static void OnTick()
@@ -2373,6 +2464,19 @@ static void OnTick()
 
     UpdateCountdown();
     CheckAllFinished();
+    ApplyTimerMode();
+}
+
+// 空闲时降低轮询频率（1s），监测中保持 200ms，兼顾精度与功耗
+static void ApplyTimerMode()
+{
+    static UINT lastInterval = 0;
+
+    UINT want = (g_running || g_playExam >= 0) ? 200 : 1000;
+    if (want == lastInterval) return;
+
+    lastInterval = want;
+    SetTimer(g_hwnd, TIMER_TICK, want, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,7 +2548,7 @@ static void StartMonitoring()
     g_running = true;
 
     EnableWindow(hBtnStart, FALSE);
-    SetWindowTextW(hBtnStart, L"运 行 中");
+    SetWindowTextW(hBtnStart, L"监测中");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
     // 运行中仍可继续排入新场次，只锁定删除类操作
@@ -2457,6 +2561,7 @@ static void StartMonitoring()
 
     UpdateAllNodeRows();
     UpdateCountdown();
+    ApplyTimerMode();
     SaveSettings();
 }
 
@@ -2488,7 +2593,7 @@ static void PerformEmergencyStop()
     g_stoppedByUser = true;
 
     EnableWindow(hBtnStart, TRUE);
-    SetWindowTextW(hBtnStart, L"启 动 监 测");
+    SetWindowTextW(hBtnStart, L"启动监测");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
     EnableWindow(hBtnDel, g_examCount > 0);
@@ -2498,6 +2603,7 @@ static void PerformEmergencyStop()
 
     UpdateAllNodeRows();
     UpdateCountdown();
+    ApplyTimerMode();
 }
 
 // 清空输入区域，便于继续添加下一场
@@ -2722,19 +2828,6 @@ static HBRUSH StateBrush(int state)
     return bDisabledBg;
 }
 
-static COLORREF StateBgColor(int state)
-{
-    switch (state)
-    {
-        case ST_PEND: return C_ST_PEND_BG;
-        case ST_PLAY: return C_ST_PLAY_BG;
-        case ST_DONE: return C_ST_DONE_BG;
-        case ST_MISS: return C_ST_MISS_BG;
-        case ST_CANC: return C_ST_CANC_BG;
-    }
-    return RGB(233, 236, 240);
-}
-
 static COLORREF StateColor(int state)
 {
     switch (state)
@@ -2757,35 +2850,104 @@ static int StateIndexOf(HWND h)
     return -1;
 }
 
+// 统一的胶囊：左侧小圆点 + 文字，浅底无描边（贴近任务管理类软件的状态标记）
+static void DrawStatusChip(HDC dc, RECT box, int state, const wchar_t* text, HFONT font, int dotSize)
+{
+    HBRUSH brush = StateBrush(state);
+    HGDIOBJ ob = SelectObject(dc, brush);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, box.bottom - box.top, box.bottom - box.top);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+
+    int cy = (box.top + box.bottom) / 2;
+    int r = dotSize / 2;
+    int dx = box.left + dotSize + (box.bottom - box.top) / 4;
+
+    HBRUSH dot = CreateSolidBrush(StateColor(state));
+    HGDIOBJ db = SelectObject(dc, dot);
+    HGDIOBJ dp = SelectObject(dc, GetStockObject(NULL_PEN));
+    Ellipse(dc, dx - r, cy - r, dx - r + dotSize, cy - r + dotSize);
+    SelectObject(dc, dp);
+    SelectObject(dc, db);
+    DeleteObject(dot);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, StateColor(state));
+
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    RECT tr = box;
+    tr.left = dx + dotSize + dotSize / 2;
+    DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+}
+
 static void DrawNodeChip(LPDRAWITEMSTRUCT d, int kind)
 {
     int state = NodeStateAt(kind);
 
-    HBRUSH back = CreateSolidBrush(C_BG);
-    FillRect(d->hDC, &d->rcItem, back);
-    DeleteObject(back);
+    FillRect(d->hDC, &d->rcItem, bSurface);
 
     RECT r = d->rcItem;
-    r.right -= 1;
-    r.bottom -= 1;
+    r.right -= S(1);
+    r.bottom -= S(1);
 
-    HGDIOBJ oldBrush = SelectObject(d->hDC, StateBrush(state));
-    HPEN pen = CreatePen(PS_SOLID, 1, StateBgColor(state));
-    HGDIOBJ oldPen = SelectObject(d->hDC, pen);
-    RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, S(10), S(10));
-    SelectObject(d->hDC, oldPen);
-    SelectObject(d->hDC, oldBrush);
-    DeleteObject(pen);
+    wchar_t text[64] = {0};
+    GetWindowTextW(d->hwndItem, text, 64);
+
+    DrawStatusChip(d->hDC, r, state, text, fState, S(7));
+}
+
+// 顶部运行状态胶囊：按运行态直接取色
+static void DrawRunChip(LPDRAWITEMSTRUCT d)
+{
+    COLORREF bg, fg;
+    switch (g_runChip)
+    {
+        case 1: bg = RGB(226, 240, 232); fg = RGB(24, 100, 70);  break;  // 运行中
+        case 2: bg = RGB(252, 231, 206); fg = RGB(140, 76, 0);   break;  // 临近 1 分钟
+        case 3: bg = RGB(226, 240, 232); fg = RGB(24, 100, 70);  break;  // 已完成
+        case 4: bg = RGB(250, 228, 228); fg = RGB(158, 40, 34);  break;  // 已急停
+        default: bg = RGB(238, 241, 245); fg = RGB(96, 105, 118); break; // 待启动
+    }
+
+    FillRect(d->hDC, &d->rcItem, bSurface);
+
+    RECT r = d->rcItem;
+    r.bottom -= S(1);
+
+    HBRUSH brush = CreateSolidBrush(bg);
+    HGDIOBJ ob = SelectObject(d->hDC, brush);
+    HGDIOBJ op = SelectObject(d->hDC, GetStockObject(NULL_PEN));
+    RoundRect(d->hDC, r.left, r.top, r.right, r.bottom,
+              r.bottom - r.top, r.bottom - r.top);
+    SelectObject(d->hDC, op);
+    SelectObject(d->hDC, ob);
+    DeleteObject(brush);
+
+    int cy = (r.top + r.bottom) / 2;
+    int dot = S(7);
+
+    HBRUSH db = CreateSolidBrush(fg);
+    HGDIOBJ b1 = SelectObject(d->hDC, db);
+    HGDIOBJ p1 = SelectObject(d->hDC, GetStockObject(NULL_PEN));
+    Ellipse(d->hDC, r.left + S(11), cy - dot / 2,
+            r.left + S(11) + dot, cy - dot / 2 + dot);
+    SelectObject(d->hDC, p1);
+    SelectObject(d->hDC, b1);
+    DeleteObject(db);
 
     wchar_t text[64] = {0};
     GetWindowTextW(d->hwndItem, text, 64);
 
     SetBkMode(d->hDC, TRANSPARENT);
-    SetTextColor(d->hDC, StateColor(state));
+    SetTextColor(d->hDC, fg);
 
-    HGDIOBJ oldFont = SelectObject(d->hDC, fState);
-    DrawTextW(d->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(d->hDC, oldFont);
+    RECT tr = r;
+    tr.left += S(26);
+    HGDIOBJ f = SelectObject(d->hDC, fState);
+    DrawTextW(d->hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(d->hDC, f);
 }
 
 // 日程列表自绘：左侧名称 + 开始时间，右侧状态胶囊
@@ -2859,23 +3021,11 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
 
     RECT chip;
     chip.right = r.right - S(14);
-    chip.left = chip.right - S(74);
+    chip.left = chip.right - S(78);
     chip.top = r.top + (r.bottom - r.top - S(24)) / 2;
     chip.bottom = chip.top + S(24);
 
-    HBRUSH chipBrush = StateBrush(state);
-    HGDIOBJ oldBrush = SelectObject(d->hDC, chipBrush);
-    HPEN chipPen = CreatePen(PS_SOLID, 1, StateBgColor(state));
-    HGDIOBJ prevPen = SelectObject(d->hDC, chipPen);
-    RoundRect(d->hDC, chip.left, chip.top, chip.right, chip.bottom, S(12), S(12));
-    SelectObject(d->hDC, prevPen);
-    SelectObject(d->hDC, oldBrush);
-    DeleteObject(chipPen);
-
-    SetTextColor(d->hDC, StateColor(state));
-    SelectObject(d->hDC, fState);
-    RECT chipText = chip;
-    DrawTextW(d->hDC, text, -1, &chipText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawStatusChip(d->hDC, chip, state, text, fState, S(7));
 
     SelectObject(d->hDC, oldFont);
 }
@@ -2887,15 +3037,43 @@ static void DrawOwnedButton(LPDRAWITEMSTRUCT d)
 
     bool pressed  = (d->itemState & ODS_SELECTED) != 0;
     bool disabled = (d->itemState & ODS_DISABLED) != 0;
+    bool hot      = (g_hotBtn == d->hwndItem);
 
     COLORREF fill;
+    COLORREF txt;
     if (disabled)
     {
-        fill = (info->kind == BTN_TOOL) ? RGB(247, 248, 250) : RGB(226, 229, 234);
+        if (info->kind == BTN_TOOL)
+        {
+            fill = RGB(248, 249, 251);
+            txt = C_DISABLED;
+        }
+        else if (info->kind == BTN_PRIMARY)
+        {
+            // 主按钮被禁用代表“正在跑”，用浅绿底 + 绿字表达状态，而不是死灰
+            fill = RGB(232, 242, 236);
+            txt = RGB(74, 120, 100);
+        }
+        else
+        {
+            fill = RGB(250, 235, 235);
+            txt = RGB(178, 122, 122);
+        }
+    }
+    else if (pressed)
+    {
+        fill = info->pressed;
+        txt = (info->kind == BTN_TOOL) ? C_INK : RGB(255, 255, 255);
+    }
+    else if (hot)
+    {
+        fill = info->hover;
+        txt = (info->kind == BTN_TOOL) ? C_INK : RGB(255, 255, 255);
     }
     else
     {
-        fill = pressed ? info->pressed : info->normal;
+        fill = info->normal;
+        txt = (info->kind == BTN_TOOL) ? C_INK : RGB(255, 255, 255);
     }
 
     RECT r = d->rcItem;
@@ -2927,15 +3105,7 @@ static void DrawOwnedButton(LPDRAWITEMSTRUCT d)
     GetWindowTextW(d->hwndItem, text, 160);
 
     SetBkMode(d->hDC, TRANSPARENT);
-
-    if (info->kind == BTN_TOOL)
-    {
-        SetTextColor(d->hDC, disabled ? C_DISABLED : C_INK);
-    }
-    else
-    {
-        SetTextColor(d->hDC, disabled ? RGB(128, 135, 146) : RGB(255, 255, 255));
-    }
+    SetTextColor(d->hDC, txt);
 
     // 大号按钮用粗体大字，小号（如添加到日程）沿用工具栏字号
     bool big = (r.bottom - r.top) > S(40);
@@ -3010,19 +3180,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         FillRect(dc, &client, bBg);
 
         RECT header = client;
-        header.bottom = S(104);
+        header.bottom = S(kHeaderH);
         FillRect(dc, &header, bSurface);
 
         RECT footer = client;
-        footer.top = S(682);
+        footer.top = S(kFooterY);
         FillRect(dc, &footer, bSurface);
 
         HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
         HGDIOBJ oldPen = SelectObject(dc, pen);
-        MoveToEx(dc, 0, S(104) - 1, NULL);
-        LineTo(dc, client.right, S(104) - 1);
-        MoveToEx(dc, 0, S(682), NULL);
-        LineTo(dc, client.right, S(682));
+        MoveToEx(dc, 0, S(kHeaderH) - 1, NULL);
+        LineTo(dc, client.right, S(kHeaderH) - 1);
+        MoveToEx(dc, 0, S(kFooterY), NULL);
+        LineTo(dc, client.right, S(kFooterY));
         SelectObject(dc, oldPen);
         DeleteObject(pen);
 
@@ -3032,10 +3202,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         DrawCard(dc, kCardAudio, L"音频文件");
         DrawCard(dc, kCardLog,   L"运行日志");
 
-        // 输入框外框（子窗口自身无边框，这里补一圈圆角描边）
+        // 输入框描边（列表与日志采用无边框的嵌入式面板）
         DrawFieldFrame(dc, hEditName);
-        DrawFieldFrame(dc, hExamList);
-        DrawFieldFrame(dc, hLog);
 
         // 空日程占位
         if (g_examCount == 0 && hExamList)
@@ -3079,7 +3247,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SetBkColor(dc, C_SURFACE);
 
         if (control == hSync) SetTextColor(dc, g_syncTextColor);
-        else if (control == hCountdown) SetTextColor(dc, g_countColor);
         else if (control == hSubtitle || control == hDate || control == hSetHint ||
                  control == hExamCount || control == hFootHint ||
                  control == hAudioFile[0] || control == hAudioFile[1] || control == hAudioFile[2] ||
@@ -3093,10 +3260,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CTLCOLOREDIT:
     {
         HDC dc = (HDC)wParam;
+        HWND control = (HWND)lParam;
+
         SetBkMode(dc, OPAQUE);
         SetTextColor(dc, C_INK);
-        SetBkColor(dc, C_SURFACE);
-        return (LRESULT)bEdit;
+
+        // 日志区用更浅的底色，与正文区区分
+        bool isLog = (control == hLog);
+        SetBkColor(dc, isLog ? RGB(250, 251, 252) : C_SURFACE);
+        return (LRESULT)(isLog ? bLog : bEdit);
     }
 
     case WM_CTLCOLORLISTBOX:
@@ -3108,6 +3280,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return (LRESULT)bSurface;
     }
 
+    case WM_ERASEBKGND:
+        // 双缓冲已覆盖整窗，禁止系统再刷一遍背景，减少闪烁与绘制开销
+        return 1;
+
     case WM_DRAWITEM:
     {
         LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lParam;
@@ -3118,8 +3294,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         else if (d->CtlType == ODT_STATIC)
         {
-            int idx = StateIndexOf(d->hwndItem);
-            DrawNodeChip(d, idx < 0 ? 0 : idx);
+            if (d->hwndItem == hCountdown)
+            {
+                DrawRunChip(d);
+            }
+            else
+            {
+                int idx = StateIndexOf(d->hwndItem);
+                DrawNodeChip(d, idx < 0 ? 0 : idx);
+            }
         }
         else
         {
@@ -3383,11 +3566,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     cc.lpszClassName = L"EBCalendar";
     RegisterClassExW(&cc);
 
-    RECT rc = { 0, 0, S(1020), S(760) };
+    RECT rc = { 0, 0, S(1020), S(752) };
     AdjustWindowRectEx(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
 
     HWND hwnd = CreateWindowExW(0, L"ExamBellWindow", L"考试自动打铃",
-                                WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                                WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT,
                                 rc.right - rc.left, rc.bottom - rc.top,
                                 NULL, NULL, instance, NULL);
@@ -3408,7 +3591,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     CenterWindow(hwnd);
     UpdateWindow(hwnd);
 
-    SetTimer(hwnd, TIMER_TICK, 200, NULL);
+    SetTimer(hwnd, TIMER_TICK, 1000, NULL);
 
     // 启动即校时
     PostMessageW(hwnd, WM_COMMAND, MAKELONG(ID_SYNC, BN_CLICKED), 0);
