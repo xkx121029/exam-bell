@@ -15,7 +15,7 @@
 - 监测进行中仍可继续添加新场次，无需急停；
 - 全部节点触发后自动复位，可立即继续排下一场。
 
-`dist\ExamBell.exe` 约 950 KB，静态链接，只调用系统自带 DLL，**零安装**。空闲时 CPU 占用约 `0%`、私有内存约 `4 MB`。
+`dist\ExamBell.exe` 约 960 KB，静态链接，只调用系统自带 DLL，**零安装**。空闲时 CPU 占用约 `0%`、私有内存约 `4 MB`。
 
 ---
 
@@ -92,6 +92,8 @@
 
 除了手动选择，也可以把音频文件放进 exe 同级的 `audio` 目录，并以 `01`、`02`、`03` 开头命名，程序会自动识别对应节点。
 
+支持 `WAV / MP3 / WMA / MP4 / M4A`。其中 WAV、MP3、WMA 走 MCI，MP4、M4A 走系统自带的 Media Foundation（只取声音轨，不会弹出视频窗口）。
+
 ### 未设置音频时的兜底
 
 没有选择音频文件时，程序退化为播放系统提示音，保证节点到点一定有声音。
@@ -102,7 +104,7 @@
 
 - 操作系统：Windows 7 SP1 x64（Windows 10 / 11 亦可正常运行）
 - 运行库：**无**。不依赖 .NET、VC++ 运行库或任何第三方 DLL
-- 依赖的系统组件：`KERNEL32 / USER32 / GDI32 / COMCTL32 / comdlg32 / WINHTTP / WINMM / msvcrt`（均为 Windows 自带）
+- 依赖的系统组件：`KERNEL32 / USER32 / GDI32 / COMCTL32 / comdlg32 / WINHTTP / WINMM / MFPlay / MFPlat / OLE32 / msvcrt`（均为 Windows 自带）
 - 无需管理员权限
 
 可用如下命令核对依赖清单：
@@ -238,7 +240,9 @@ exam-bell/
 
 ### 3. 音频播放
 
-调用 `winmm.dll` 的 MCI（`mciSendString`），先按扩展名自动打开，失败再依次尝试 `mpegvideo`、`waveaudio` 设备类型。不引入任何第三方库，系统自带解码即可播放 WAV / MP3 / WMA。
+WAV / MP3 / WMA 调用 `winmm.dll` 的 MCI（`mciSendString`），先按扩展名自动打开，失败再依次尝试 `mpegvideo`、`waveaudio` 设备类型。
+
+MCI 的 `mpegvideo` 只认 MPEG-1，放不了 MP4，因此 MP4 / M4A 改走系统自带的 Media Foundation（`MFPCreateMediaPlayer`，Windows 7 起随系统提供）。播放器窗口句柄传 `NULL`，只出声不出画面。两套引擎共用同一个「是否正在播放」判定与播放看门狗，任一引擎失败都会退回系统提示音。不引入任何第三方库。
 
 ### 4. 急停
 
@@ -304,6 +308,12 @@ exam-bell/
 ---
 
 ## 更新日志
+
+### 2026-10-30 · v1.6.1
+
+- 铃声支持 MP4 / M4A：MCI 的 `mpegvideo` 设备只能放 MPEG-1，无法处理 MP4，改为走系统自带的 Media Foundation（`MFPCreateMediaPlayer`，窗口句柄传 `NULL`，只出声不出画面）；
+- 音频选择框、`audio` 目录自动识别、试听失败提示同步支持 MP4 / M4A；
+- 播放宽限期由 1.2 秒放宽到 3 秒，给 MF 解码器初始化留出时间，避免 MP4 刚起播就被误判为「未进入播放状态」。
 
 ### 2026-10-30 · v1.6.0
 

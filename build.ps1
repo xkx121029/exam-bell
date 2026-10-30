@@ -24,7 +24,7 @@ try {
     try {
         & "$Mingw\g++.exe" -O2 -mwindows -municode -static -static-libgcc -static-libstdc++ -w `
             -o dist\ExamBell.exe src-native\exambell.cpp $ResObj `
-            -lwinhttp -lwinmm -lcomctl32 -lgdi32 -luser32
+            -lwinhttp -lwinmm -lcomctl32 -lgdi32 -luser32 -lole32
         if ($LASTEXITCODE -ne 0) { throw 'g++ 链接失败' }
     }
     finally {

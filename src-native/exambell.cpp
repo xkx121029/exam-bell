@@ -16,6 +16,8 @@
 #include <wctype.h>
 #include <locale.h>
 #include <vector>
+#include <mfapi.h>
+#include <mfplay.h>
 
 // ---------------------------------------------------------------------------
 // 配色
@@ -709,7 +711,8 @@ static std::wstring FindDefaultAudio(int index)
 
         std::wstring ext = full.substr(dot);
         for (size_t k = 0; k < ext.size(); k++) ext[k] = towlower(ext[k]);
-        if (ext != L".wav" && ext != L".mp3" && ext != L".wma") continue;
+        if (ext != L".wav" && ext != L".mp3" && ext != L".wma" &&
+            ext != L".mp4" && ext != L".m4a") continue;
 
         if (best.empty() || full.compare(best) < 0) best = full;
     }
@@ -777,6 +780,116 @@ static bool MciPlay(const std::wstring& path)
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// MP4 / M4A 等格式：MCI 的 mpegvideo 设备只认 MPEG-1，放不了 MP4
+// 这里用系统自带的 Media Foundation（Windows 7 起随系统提供）补位
+// ---------------------------------------------------------------------------
+static bool g_mfReady = false;         // MFStartup 是否已成功
+static IMFPMediaPlayer* g_mfPlayer = NULL;
+static bool g_audioByMf = false;       // 当前响的是不是 MF 那一路
+
+// 动态加载 Media Foundation：部分 N 版 / 精简版 Windows 没有 mfplay.dll，
+// 若是静态导入，整个程序会直接启动失败。动态加载后最坏只是放不了 MP4。
+typedef HRESULT (WINAPI* PFN_MFSTARTUP)(ULONG, DWORD);
+typedef HRESULT (WINAPI* PFN_MFCREATE)(LPCWSTR, BOOL, MFP_CREATION_OPTIONS,
+                                       IMFPMediaPlayerCallback*, HWND, IMFPMediaPlayer**);
+
+static HMODULE g_mfplatDll = NULL, g_mfplayDll = NULL;
+static PFN_MFSTARTUP     g_pMfStartup = NULL;
+static PFN_MFCREATE      g_pMfCreate = NULL;
+
+static bool ExtIs(const std::wstring& path, const wchar_t* ext)
+{
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    return lstrcmpiW(path.c_str() + dot, ext) == 0;
+}
+
+static bool NeedMediaFoundation(const std::wstring& path)
+{
+    return ExtIs(path, L".mp4") || ExtIs(path, L".m4v") ||
+           ExtIs(path, L".mov") || ExtIs(path, L".m4a") || ExtIs(path, L".aac");
+}
+
+static bool MfEnsure()
+{
+    if (g_mfReady) return true;
+
+    if (!g_mfplatDll) g_mfplatDll = LoadLibraryW(L"mfplat.dll");
+    if (!g_mfplayDll) g_mfplayDll = LoadLibraryW(L"mfplay.dll");
+    if (!g_mfplatDll || !g_mfplayDll) return false;
+
+    if (!g_pMfStartup) g_pMfStartup =
+        (PFN_MFSTARTUP)GetProcAddress(g_mfplatDll, "MFStartup");
+    if (!g_pMfCreate) g_pMfCreate =
+        (PFN_MFCREATE)GetProcAddress(g_mfplayDll, "MFPCreateMediaPlayer");
+    if (!g_pMfStartup || !g_pMfCreate) return false;
+
+    // MFPlay 要求调用线程初始化过 COM
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    g_mfReady = SUCCEEDED(g_pMfStartup(MF_VERSION, MFSTARTUP_NOSOCKET));
+    return g_mfReady;
+}
+
+static void MfClose()
+{
+    if (g_mfPlayer)
+    {
+        g_mfPlayer->Stop();
+        g_mfPlayer->Shutdown();
+        g_mfPlayer->Release();
+        g_mfPlayer = NULL;
+    }
+    g_audioByMf = false;
+}
+
+static bool MfIsPlaying()
+{
+    if (!g_mfPlayer) return false;
+
+    MFP_MEDIAPLAYER_STATE state = MFP_MEDIAPLAYER_STATE_EMPTY;
+    if (FAILED(g_mfPlayer->GetState(&state))) return false;
+    return state == MFP_MEDIAPLAYER_STATE_PLAYING;
+}
+
+static bool MfPlay(const std::wstring& path)
+{
+    MfClose();
+    if (!MfEnsure()) return false;
+
+    // 直接用带 URL 的构造参数建播放器并要求立即播放。
+    // 不走 SetMediaItem：MinGW 头文件把它的 fPlay 参数漏掉了，调用会错位。
+    // 每个节点建一次播放器，开销完全可以接受。
+    if (FAILED(g_pMfCreate(path.c_str(), TRUE, MFP_OPTION_NONE, NULL, NULL, &g_mfPlayer)))
+    {
+        g_mfPlayer = NULL;
+        return false;
+    }
+
+    g_audioByMf = true;
+    return true;
+}
+
+// 统一入口：按格式挑引擎，切换前先彻底停掉上一路，避免两路同时发声
+static void AudioStopAll()
+{
+    MciClose();
+    MfClose();
+}
+
+static bool AudioIsPlaying()
+{
+    return g_audioByMf ? MfIsPlaying() : MciIsPlaying();
+}
+
+static bool AudioPlay(const std::wstring& path)
+{
+    AudioStopAll();
+    if (path.empty() || !FileExists(path)) return false;
+    if (NeedMediaFoundation(path)) return MfPlay(path);
+    return MciPlay(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -2450,7 +2563,7 @@ static bool StartBellAudio(int kind)
         return false;
     }
 
-    if (!MciPlay(file))
+    if (!AudioPlay(file))
     {
         Log(L"音频播放失败，改用系统提示音");
         return false;
@@ -2552,14 +2665,15 @@ static void OnTick()
     // 播放结束检测 + 看门狗
     if (g_playExam >= 0)
     {
-        bool playing = MciIsPlaying();
+        bool playing = AudioIsPlaying();
 
         if (playing) g_playVerified = true;
 
-        // MCI 刚 open 的那一瞬间可能还没报告 playing，先给它一点时间，
+        // 刚 open 的那一瞬间可能还没报告 playing，先给它一点时间，
         // 否则会把刚开始没多久的音频误判为“已播完”。
+        // MP4 走 Media Foundation，解码器初始化更慢，宽限期放宽到 3 秒。
         ULONGLONG elapsed = GetTickCount64() - g_playStartTick;
-        bool graceOver = elapsed > 1200;
+        bool graceOver = elapsed > 3000;
 
         if (g_playVerified && !playing)
         {
@@ -2590,7 +2704,7 @@ static void OnTick()
         {
             // 看门狗：一段音频超过 10 分钟仍在“播放”，多半是设备被拔掉 / 驱动卡死
             Log(L"音频播放超时（超过 10 分钟），强制结束并继续后续节点");
-            MciClose();
+            AudioStopAll();
             if (g_playExam < g_examCount &&
                 g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
             {
@@ -2713,7 +2827,7 @@ static void StartMonitoring()
     g_playKind = -1;
     g_bellQueue.clear();
     g_playVerified = false;
-    MciClose();
+    AudioStopAll();
 
     int activeNodes = 0;
     int firstActive = -1;
@@ -2770,7 +2884,7 @@ static void PerformEmergencyStop()
     }
 
     MciStop();
-    MciClose();
+    AudioStopAll();
     g_playExam = -1;
     g_playKind = -1;
     g_bellQueue.clear();
@@ -2957,7 +3071,9 @@ static void ChooseAudio(int index)
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFilter = L"音频文件 (*.wav;*.mp3;*.wma)\0*.wav;*.mp3;*.wma\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"音频/视频文件 (*.wav;*.mp3;*.wma;*.mp4;*.m4a)\0"
+                      L"*.wav;*.mp3;*.wma;*.mp4;*.m4a\0"
+                      L"所有文件 (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrTitle = L"选择提示音频";
@@ -2998,10 +3114,10 @@ static void PreviewAudio(int index)
         UpdateAllNodeRows();
     }
 
-    if (!MciPlay(g_audio[index]))
+    if (!AudioPlay(g_audio[index]))
     {
         MessageBoxW(g_hwnd,
-                    L"音频播放失败。\r\n\r\n请确认文件为 WAV / MP3 / WMA 格式且可正常播放，"
+                    L"音频播放失败。\r\n\r\n请确认文件为 WAV / MP3 / WMA / MP4 格式且可正常播放，"
                     L"以及系统音频设备工作正常。",
                     L"播放失败", MB_OK | MB_ICONWARNING);
         return;
@@ -3684,7 +3800,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         SaveSettings();
-        MciClose();
+        AudioStopAll();
         DestroyWindow(hwnd);
         return 0;
 
