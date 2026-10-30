@@ -11,6 +11,7 @@
 #include <mmsystem.h>
 #include <commctrl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string>
 #include <wctype.h>
@@ -58,7 +59,8 @@ enum CtlId
     ID_START = 1000, ID_STOP, ID_SYNC, ID_FILL, ID_EDIT_NAME, ID_LOG,
     ID_EXAM_LIST, ID_ADD_EXAM, ID_DEL_EXAM, ID_CLEAR_EXAM, ID_TIME_PICK,
     ID_PICK0 = 1030, ID_PICK1, ID_PICK2,
-    ID_PLAY0 = 1040, ID_PLAY1, ID_PLAY2
+    ID_PLAY0 = 1040, ID_PLAY1, ID_PLAY2,
+    ID_GAP0 = 1050, ID_GAP1
 };
 
 #define WM_SYNC_DONE (WM_APP + 10)
@@ -70,15 +72,40 @@ enum CtlId
 enum NodeState { ST_NONE = 0, ST_PEND, ST_PLAY, ST_DONE, ST_MISS, ST_CANC };
 enum BtnKind   { BTN_TOOL = 0, BTN_PRIMARY, BTN_DANGER };
 
-// 三个打铃节点相对考试开始时间的偏移（分钟）
-static const int kNodeOffsetMin[NODE_COUNT] = { -10, -5, 0 };
-static const wchar_t* kNodeName[NODE_COUNT] =
+// 同一场考试内相邻两次打铃的间隔（分钟），可在界面里调整：
+// g_gapMin[0] = 第 1 次 → 第 2 次，g_gapMin[1] = 第 2 次 → 第 3 次，
+// 第 3 次固定落在考试开始时刻。
+static int g_gapMin[2] = { 5, 5 };
+
+#define GAP_MIN 1
+#define GAP_MAX 60
+
+// 第 kind 个节点相对考试开始时间的偏移（分钟，负数为提前）
+static int NodeOffsetMin(int kind)
 {
-    L"考前 10 分钟 · 考生进入考场",
-    L"考前 5 分钟 · 下发试卷与答题卡",
-    L"考试开始 · 考生开始作答"
-};
-static const wchar_t* kNodeShort[NODE_COUNT] = { L"考前 10 分钟", L"考前 5 分钟", L"考试开始" };
+    if (kind == 0) return -(g_gapMin[0] + g_gapMin[1]);
+    if (kind == 1) return -g_gapMin[1];
+    return 0;
+}
+
+// 节点短名，随间隔设置变化，例如「考前 15 分钟」「考试开始」
+static std::wstring NodeShortName(int kind)
+{
+    if (kind == 0 || kind == 1)
+    {
+        int minutes = (kind == 0) ? g_gapMin[0] + g_gapMin[1] : g_gapMin[1];
+        return L"考前 " + std::to_wstring(minutes) + L" 分钟";
+    }
+    return L"考试开始";
+}
+
+// 节点完整说明，用于「打铃节点」面板
+static std::wstring NodeFullName(int kind)
+{
+    if (kind == 0) return NodeShortName(0) + L" · 考生进入考场";
+    if (kind == 1) return NodeShortName(1) + L" · 下发试卷与答题卡";
+    return L"考试开始 · 考生开始作答";
+}
 
 struct BtnInfo
 {
@@ -101,6 +128,7 @@ static HWND hBtnClear = NULL, hExamCount = NULL, hSetHint = NULL;
 static HWND hExamList = NULL;
 static HWND hNodeTitle = NULL, hNodeName[3] = {0}, hNodeTime[3] = {0}, hNodeState[3] = {0};
 static HWND hAudioCap[3] = {0}, hAudioFile[3] = {0}, hBtnPick[3] = {0}, hBtnPlay[3] = {0};
+static HWND hGapEdit[2] = {0};
 static HWND hLog = NULL;
 static HWND hBtnStart = NULL, hBtnStop = NULL, hFootHint = NULL;
 
@@ -278,7 +306,7 @@ static std::wstring FormatDate(__int64 ticks)
 static std::wstring NodeName(int index)
 {
     if (index < 0 || index >= NODE_COUNT) return L"";
-    return kNodeShort[index];
+    return NodeShortName(index);
 }
 
 static std::wstring FileNameOf(const std::wstring& path)
@@ -294,6 +322,7 @@ static bool FileExists(const std::wstring& path)
 }
 
 static void Log(const std::wstring& message);
+static void SyncGapUi();
 
 // ---------------------------------------------------------------------------
 // 运行日志落盘（%APPDATA%\ExamBell\exam_bell.log）
@@ -446,6 +475,11 @@ static void SaveSettings()
         text += g_audio[i];
         text += L"\r\n";
     }
+
+    // 同一场考试内相邻两次打铃的间隔（分钟）
+    wchar_t gap[32];
+    swprintf(gap, 32, L"gap1=%d\r\ngap2=%d\r\n", g_gapMin[0], g_gapMin[1]);
+    text += gap;
 
     std::wstring path = ConfigPath();
 
@@ -618,6 +652,14 @@ static void LoadSettings()
                     else if (key == L"audio0") audioValue[0] = value;
                     else if (key == L"audio1") audioValue[1] = value;
                     else if (key == L"audio2") audioValue[2] = value;
+                    else if (key == L"gap1" || key == L"gap2")
+                    {
+                        // 间隔配置：非法值一律夹到 GAP_MIN..GAP_MAX
+                        int v = _wtoi(value.c_str());
+                        if (v < GAP_MIN) v = GAP_MIN;
+                        if (v > GAP_MAX) v = GAP_MAX;
+                        g_gapMin[key == L"gap1" ? 0 : 1] = v;
+                    }
                     else if (key.size() >= 10 && key.compare(0, 4, L"exam") == 0)
                     {
                         // examN_name / examN_time
@@ -675,6 +717,9 @@ static void LoadSettings()
     }
 
     g_selectedExam = (g_examCount > 0) ? 0 : -1;
+
+    // 控件先于本函数创建，读完配置要把间隔回填到输入框与节点名称
+    SyncGapUi();
 }
 
 // 从 exe 同级 audio 目录按 01 / 02 / 03 前缀自动识别音频
@@ -2216,10 +2261,37 @@ static void BuildUi()
 
     for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = kCardNode.y + 72 + i * 50;
-        hNodeName[i]  = MakeStatic(kNodeName[i], kCardNode.x + 14, y, 310, 24, fRow, SS_LEFT);
+        int y = kCardNode.y + 70 + i * 46;
+        hNodeName[i]  = MakeStatic(NodeFullName(i).c_str(), kCardNode.x + 14, y, 310, 24, fRow, SS_LEFT);
         hNodeTime[i]  = MakeStatic(L"—", kCardNode.x + 336, y, 130, 24, fRow, SS_LEFT);
         hNodeState[i] = MakeChip(L"未排期", kCardNode.x + 480, y, 120, 24, fState);
+    }
+
+    // 两次打铃之间的间隔：独立设置条，上方用细线与节点列表分开
+    {
+        int gy = kCardNode.y + 200;
+
+        MakeStatic(L"打铃间隔（全部场次）", kCardNode.x + 14, gy + 2, 120, 18, fHint, SS_LEFT);
+        MakeStatic(L"第 1→2 次", kCardNode.x + 142, gy + 2, 72, 18, fHint, SS_LEFT);
+        MakeStatic(L"分钟", kCardNode.x + 268, gy + 2, 26, 18, fHint, SS_LEFT);
+        MakeStatic(L"第 2→3 次", kCardNode.x + 316, gy + 2, 72, 18, fHint, SS_LEFT);
+        MakeStatic(L"分钟", kCardNode.x + 442, gy + 2, 26, 18, fHint, SS_LEFT);
+        MakeStatic(L"第 3 次固定为考试开始", kCardNode.x + 486, gy + 2, 140, 18, fHint, SS_LEFT);
+
+        for (int i = 0; i < 2; i++)
+        {
+            int x = kCardNode.x + (i == 0 ? 218 : 392);
+            hGapEdit[i] = CreateWindowExW(0, L"EDIT", L"",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_NUMBER,
+                                          S(x), S(gy), S(44), S(22),
+                                          g_hwnd, (HMENU)(ID_GAP0 + i), NULL, NULL);
+            SendMessageW(hGapEdit[i], WM_SETFONT, (WPARAM)fState, TRUE);
+            SendMessageW(hGapEdit[i], EM_SETLIMITTEXT, 2, 0);
+
+            wchar_t buf[8];
+            swprintf(buf, 8, L"%d", g_gapMin[i]);
+            SetWindowTextW(hGapEdit[i], buf);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2230,7 +2302,7 @@ static void BuildUi()
         int y = kCardAudio.y + 42 + i * 50;
 
         // 左侧上下两行：节点名 + 文件名
-        hAudioCap[i]  = MakeStatic(kNodeShort[i], kCardAudio.x + 14, y, 96, 20, fRow, SS_LEFT);
+        hAudioCap[i]  = MakeStatic(NodeShortName(i).c_str(), kCardAudio.x + 14, y, 96, 20, fRow, SS_LEFT);
         hAudioFile[i] = MakeStatic(L"未选择", kCardAudio.x + 14, y + 20, 180, 18,
                                    fState, SS_LEFT | SS_ENDELLIPSIS);
 
@@ -2332,7 +2404,7 @@ static int NodeStateAt(int kind)
     const Exam& e = g_exam[g_selectedExam];
     if (e.nodeState[kind] != ST_NONE) return e.nodeState[kind];
 
-    __int64 ft = e.startFt + (__int64)kNodeOffsetMin[kind] * 60LL * 10000000LL;
+    __int64 ft = e.startFt + (__int64)NodeOffsetMin(kind) * 60LL * 10000000LL;
     if (FtNow() - ft > 60LL * 10000000LL) return ST_MISS;
     return ST_NONE;
 }
@@ -2363,7 +2435,7 @@ static void UpdateNodePanel()
     {
         int state = NodeStateAt(i);
         __int64 ft = (e.nodeState[i] == ST_NONE)
-                     ? e.startFt + (__int64)kNodeOffsetMin[i] * minute
+                     ? e.startFt + (__int64)NodeOffsetMin(i) * minute
                      : e.nodeFt[i];
 
         SetWindowTextW(hNodeTime[i], FormatMonthDayHm(ft).c_str());
@@ -2398,6 +2470,33 @@ static void UpdateAudioLabel(int index)
         SetWindowTextW(hAudioFile[index], FileNameOf(g_audio[index]).c_str());
     }
     InvalidateRect(hAudioFile[index], NULL, TRUE);
+}
+
+// 监测进行中锁定间隔设置：中途改间隔会让已排好的节点时刻失去意义
+static void SetGapEditable(bool on)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        if (hGapEdit[i]) EnableWindow(hGapEdit[i], on);
+    }
+}
+
+// 把 g_gapMin 同步到输入框与节点名称（配置加载后、间隔修改后都走这里）
+static void SyncGapUi()
+{
+    for (int i = 0; i < 2; i++)
+    {
+        if (!hGapEdit[i]) continue;
+        wchar_t buf[8];
+        swprintf(buf, 8, L"%d", g_gapMin[i]);
+        SetWindowTextW(hGapEdit[i], buf);
+    }
+
+    for (int i = 0; i < NODE_COUNT; i++)
+    {
+        if (hNodeName[i]) SetWindowTextW(hNodeName[i], NodeFullName(i).c_str());
+        if (hAudioCap[i]) SetWindowTextW(hAudioCap[i], NodeShortName(i).c_str());
+    }
 }
 
 static void RefreshExamList()
@@ -2436,6 +2535,7 @@ static void RefreshExamList()
     {
         EnableWindow(hBtnDel, g_examCount > 0);
         EnableWindow(hBtnClear, g_examCount > 0);
+        SetGapEditable(true);
     }
 
     InvalidateRect(hExamList, NULL, TRUE);
@@ -2534,6 +2634,47 @@ static void UpdateCountdown()
 
         InvalidateRect(hCountdown, NULL, TRUE);
     }
+}
+
+// 读取界面上两个「间隔」输入框：非法输入夹到 GAP_MIN..GAP_MAX 并回写显示，
+// 同时刷新节点名称、预定时刻与配置。
+static void ReadGapEdits()
+{
+    if (!hGapEdit[0] || !hGapEdit[1]) return;
+
+    bool changed = false;
+
+    for (int i = 0; i < 2; i++)
+    {
+        wchar_t typed[8] = {0};
+        GetWindowTextW(hGapEdit[i], typed, 8);
+
+        int value = _wtoi(typed);
+        if (value < GAP_MIN) value = GAP_MIN;
+        if (value > GAP_MAX) value = GAP_MAX;
+
+        if (value != g_gapMin[i])
+        {
+            g_gapMin[i] = value;
+            changed = true;
+        }
+
+        wchar_t fixed[8];
+        swprintf(fixed, 8, L"%d", g_gapMin[i]);
+        if (lstrcmpW(typed, fixed) != 0) SetWindowTextW(hGapEdit[i], fixed);
+    }
+
+    if (!changed) return;
+
+    SyncGapUi();
+    UpdateNodePanel();
+    UpdateCountdown();
+    SaveSettings();
+
+    wchar_t msg[160];
+    swprintf(msg, 160, L"打铃间隔已更新：第 1→2 次 %d 分钟，第 2→3 次 %d 分钟",
+             g_gapMin[0], g_gapMin[1]);
+    Log(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -2645,6 +2786,7 @@ static void CheckAllFinished()
 
     EnableWindow(hBtnDel, g_examCount > 0);
     EnableWindow(hBtnClear, g_examCount > 0);
+    SetGapEditable(true);
 
     Log(L"全部场次任务已结束，可继续添加或重新启动");
     UpdateCountdown();
@@ -2792,7 +2934,7 @@ static int PrepareExamNodes(int index)
 
     for (int k = 0; k < NODE_COUNT; k++)
     {
-        e.nodeFt[k] = e.startFt + (__int64)kNodeOffsetMin[k] * minute;
+        e.nodeFt[k] = e.startFt + (__int64)NodeOffsetMin(k) * minute;
 
         if (now - e.nodeFt[k] > tolerance)
         {
@@ -2861,9 +3003,10 @@ static void StartMonitoring()
     SetWindowTextW(hBtnStart, L"监测中");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
-    // 运行中仍可继续排入新场次，只锁定删除类操作
+    // 运行中仍可继续排入新场次，只锁定删除类操作与间隔设置
     EnableWindow(hBtnDel, FALSE);
     EnableWindow(hBtnClear, FALSE);
+    SetGapEditable(false);
 
     wchar_t buf[64];
     swprintf(buf, 64, L"开始监测 · 共 %d 场，%d 个节点待触发", g_examCount, activeNodes);
@@ -2910,6 +3053,7 @@ static void PerformEmergencyStop()
 
     EnableWindow(hBtnDel, g_examCount > 0);
     EnableWindow(hBtnClear, g_examCount > 0);
+    SetGapEditable(true);
 
     Log(L"【急停】已停止播放并取消全部后续任务");
 
@@ -3516,8 +3660,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         DrawCard(dc, kCardAudio, L"音频文件");
         DrawCard(dc, kCardLog,   L"运行日志");
 
+        // 打铃间隔设置条与上方节点列表之间补一条细线，避免二维码般连成一片
+        HPEN hairPen = CreatePen(PS_SOLID, 1, C_LINE);
+        HGDIOBJ oldHairPen = SelectObject(dc, hairPen);
+        MoveToEx(dc, S(kCardNode.x + 14), S(kCardNode.y + 192), NULL);
+        LineTo(dc, S(kCardNode.x + kCardNode.w - 14), S(kCardNode.y + 192));
+        SelectObject(dc, oldHairPen);
+        DeleteObject(hairPen);
+
         // 输入框描边（列表与日志采用无边框的嵌入式面板）
         DrawFieldFrame(dc, hEditName);
+        DrawFieldFrame(dc, hGapEdit[0]);
+        DrawFieldFrame(dc, hGapEdit[1]);
 
         // 空日程占位
         if (g_examCount == 0 && hExamList)
@@ -3630,9 +3784,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
 
+        // 间隔输入框：失焦时生效
+        if (id == ID_GAP0 || id == ID_GAP1)
+        {
+            if (code == EN_KILLFOCUS) ReadGapEdits();
+            return 0;
+        }
+
         if (id == ID_START && code == BN_CLICKED)
         {
             if (g_running || g_pendingStart) return 0;
+
+            ReadGapEdits();   // 刚改过间隔还没失焦时，也要按新间隔排期
 
             if (g_examCount == 0)
             {
@@ -3651,7 +3814,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             {
                 for (int k = 0; k < NODE_COUNT; k++)
                 {
-                    __int64 ft = g_exam[i].startFt + (__int64)kNodeOffsetMin[k] * minute;
+                    __int64 ft = g_exam[i].startFt + (__int64)NodeOffsetMin(k) * minute;
                     if (now - ft <= tolerance) { anyNode = true; break; }
                 }
             }
