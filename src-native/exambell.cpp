@@ -6,6 +6,7 @@
 #define _UNICODE
 
 #include <windows.h>
+#include <windowsx.h>
 #include <winhttp.h>
 #include <mmsystem.h>
 #include <commctrl.h>
@@ -51,7 +52,7 @@ static const COLORREF C_ST_CANC_FG = RGB(150, 68, 68);
 enum CtlId
 {
     ID_START = 1000, ID_STOP, ID_SYNC, ID_FILL, ID_EDIT_NAME, ID_LOG,
-    ID_EXAM_LIST, ID_ADD_EXAM, ID_DEL_EXAM, ID_CLEAR_EXAM, ID_NOW30, ID_DTP,
+    ID_EXAM_LIST, ID_ADD_EXAM, ID_DEL_EXAM, ID_CLEAR_EXAM, ID_TIME_PICK,
     ID_PICK0 = 1030, ID_PICK1, ID_PICK2,
     ID_PLAY0 = 1040, ID_PLAY1, ID_PLAY2
 };
@@ -91,17 +92,26 @@ static HWND g_hwnd = NULL;
 
 static HWND hTitle = NULL, hSubtitle = NULL, hClock = NULL, hDate = NULL;
 static HWND hSync = NULL, hCountdown = NULL, hBtnSync = NULL;
-static HWND hGrpSet = NULL, hEditName = NULL, hDtp = NULL, hBtnAdd = NULL, hBtnDel = NULL;
-static HWND hBtnClear = NULL, hBtnNow = NULL, hExamCount = NULL, hSetHint = NULL;
-static HWND hExamList = NULL, hListHint = NULL;
-static HWND hGrpNode = NULL, hNodeTitle = NULL, hNodeName[3] = {0}, hNodeTime[3] = {0}, hNodeState[3] = {0};
-static HWND hGrpAudio = NULL, hAudioCap[3] = {0}, hAudioFile[3] = {0}, hBtnPick[3] = {0}, hBtnPlay[3] = {0};
-static HWND hGrpLog = NULL, hLog = NULL;
+static HWND hEditName = NULL, hTimePick = NULL, hBtnAdd = NULL, hBtnDel = NULL;
+static HWND hBtnClear = NULL, hExamCount = NULL, hSetHint = NULL;
+static HWND hExamList = NULL;
+static HWND hNodeTitle = NULL, hNodeName[3] = {0}, hNodeTime[3] = {0}, hNodeState[3] = {0};
+static HWND hAudioCap[3] = {0}, hAudioFile[3] = {0}, hBtnPick[3] = {0}, hBtnPlay[3] = {0};
+static HWND hLog = NULL;
 static HWND hBtnStart = NULL, hBtnStop = NULL, hFootHint = NULL;
+
+// 卡片区域（逻辑坐标）
+struct CardRect { int x, y, w, h; };
+
+static const CardRect kCardExam  = { 20, 116, 640, 314 };   // 考试日程
+static const CardRect kCardNode  = { 20, 442, 640, 230 };   // 打铃节点
+static const CardRect kCardAudio = { 676, 116, 324, 200 };  // 音频文件
+static const CardRect kCardLog   = { 676, 328, 324, 344 };  // 运行日志
 
 static BtnInfo biTool, biPrimary, biDanger;
 
 static COLORREF g_syncTextColor = C_MUTED;
+static COLORREF g_countColor = C_MUTED;
 
 static HFONT fTitle, fSub, fClock, fDate, fSync, fCount, fCap, fEdit, fRow, fState, fHint, fLog, fBtnTool, fStart, fStop;
 
@@ -141,7 +151,7 @@ static bool g_pendingStart = false;
 static bool g_mciOpen = false;
 
 // 刷子
-static HBRUSH bBg, bSurface, bLine, bEdit, bSel, bSelHover;
+static HBRUSH bBg, bSurface, bLine, bEdit, bSel;
 static HBRUSH bStatePend, bStatePlay, bStateDone, bStateMiss, bStateCanc, bDisabledBg;
 
 // ---------------------------------------------------------------------------
@@ -937,16 +947,6 @@ static HWND MakeChip(const wchar_t* text, int x, int y, int w, int h, HFONT font
     return control;
 }
 
-static HWND MakeGroup(const wchar_t* text, int x, int y, int w, int h)
-{
-    HWND g = CreateWindowExW(0, L"BUTTON", text,
-                             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                             S(x), S(y), S(w), S(h),
-                             g_hwnd, NULL, NULL, NULL);
-    SendMessageW(g, WM_SETFONT, (WPARAM)fCap, TRUE);
-    return g;
-}
-
 static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
                             BtnInfo* info, HFONT font, int id)
 {
@@ -957,6 +957,74 @@ static HWND MakeOwnedButton(const wchar_t* text, int x, int y, int w, int h,
     SendMessageW(b, WM_SETFONT, (WPARAM)font, TRUE);
     SetWindowLongPtrW(b, GWLP_USERDATA, (LONG_PTR)info);
     return b;
+}
+
+// 卡片：圆角白底 + 1px 边线 + 左上角标题
+static void DrawCard(HDC dc, const CardRect& card, const wchar_t* title)
+{
+    RECT r;
+    r.left = S(card.x);
+    r.top = S(card.y);
+    r.right = S(card.x + card.w);
+    r.bottom = S(card.y + card.h);
+
+    // 轻微投影
+    RECT shadow = r;
+    OffsetRect(&shadow, 0, S(1));
+    HBRUSH shadowBrush = CreateSolidBrush(RGB(232, 235, 240));
+    HGDIOBJ ob = SelectObject(dc, shadowBrush);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, shadow.left, shadow.top, shadow.right, shadow.bottom, S(12), S(12));
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(shadowBrush);
+
+    HBRUSH brush = CreateSolidBrush(C_SURFACE);
+    HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
+    HGDIOBJ b0 = SelectObject(dc, brush);
+    HGDIOBJ p0 = SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(12), S(12));
+    SelectObject(dc, p0);
+    SelectObject(dc, b0);
+    DeleteObject(pen);
+    DeleteObject(brush);
+
+    HGDIOBJ oldFont = SelectObject(dc, fCap);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_INK);
+
+    RECT tr = { r.left + S(14), r.top + S(10), r.right - S(14), r.top + S(34) };
+    DrawTextW(dc, title, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+}
+
+// 给子控件补一圈圆角描边（控件本身去掉客户端边框）
+static void DrawFieldFrame(HDC dc, HWND child)
+{
+    if (!child) return;
+
+    RECT r;
+    GetWindowRect(child, &r);
+    POINT tl = { r.left, r.top };
+    POINT br = { r.right, r.bottom };
+    ScreenToClient(g_hwnd, &tl);
+    ScreenToClient(g_hwnd, &br);
+
+    r.left = tl.x;
+    r.top = tl.y;
+    r.right = br.x;
+    r.bottom = br.y;
+    InflateRect(&r, S(1), S(1));
+
+    COLORREF line = C_LINE;
+
+    HPEN pen = CreatePen(PS_SOLID, 1, line);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(8), S(8));
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
 }
 
 static WNDPROC g_editProc = NULL;
@@ -974,47 +1042,824 @@ static LRESULT CALLBACK NameEditProc(HWND h, UINT msg, WPARAM w, LPARAM l)
     return CallWindowProcW(g_editProc, h, msg, w, l);
 }
 
-static void SetDtpTime(__int64 ft)
+// ---------------------------------------------------------------------------
+// 自绘时间选择器（不使用系统的 SysDateTimePick32）
+//   左：日历图标，点击弹出月历
+//   中：2026-10-30  09:00，点击选中某段，滚轮 / 上下箭头逐段调整
+//   右：上下微调箭头
+// -----------------------------------------------------------------------------------------------------------------------------------------
+static HWND      g_calWnd = NULL;
+static SYSTEMTIME g_pick;
+static int       g_pickSeg = 0;
+static int       g_segX[5] = {0, 0, 0, 0, 0};
+static RECT      g_segRect[5];
+static RECT      g_calIconRect, g_upRect, g_downRect;
+static bool      g_hoverCal = false, g_hoverUp = false, g_hoverDown = false;
+static ULONGLONG g_calClosedTick = 0;
+static int       g_calYear = 0, g_calMonth = 0, g_calHoverDay = -1;
+static RECT      g_calPrevRect, g_calNextRect;
+
+static int DaysInMonth(int year, int month)
 {
-    if (!hDtp) return;
-    SYSTEMTIME st = FtToSystemTime(ft);
-    st.wSecond = 0;
-    st.wMilliseconds = 0;
-    SendMessageW(hDtp, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
+    static const int days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month == 2)
+    {
+        bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        return leap ? 29 : 28;
+    }
+    if (month < 1 || month > 12) return 30;
+    return days[month - 1];
 }
 
-static __int64 GetDtpTime()
+static void NormalizePick()
 {
-    if (!hDtp) return 0;
+    int year = (int)g_pick.wYear;
+    int month = (int)g_pick.wMonth;
+    int day = (int)g_pick.wDay;
+    int hour = (int)g_pick.wHour;
+    int minute = (int)g_pick.wMinute;
 
-    SYSTEMTIME st;
-    ZeroMemory(&st, sizeof(st));
-    if (SendMessageW(hDtp, DTM_GETSYSTEMTIME, 0, (LPARAM)&st) != GDT_VALID) return 0;
-    if (st.wYear < 1970) return 0;
+    if (year < 1970) year = 1970;
+    if (year > 2200) year = 2200;
+    if (month < 1) month = 1;
+    if (month > 12) month = 12;
 
+    int dim = DaysInMonth(year, month);
+    if (day < 1) day = 1;
+    if (day > dim) day = dim;
+
+    if (hour < 0) hour = 0;
+    if (hour > 23) hour = 23;
+    if (minute < 0) minute = 0;
+    if (minute > 59) minute = 59;
+
+    g_pick.wYear = (WORD)year;
+    g_pick.wMonth = (WORD)month;
+    g_pick.wDay = (WORD)day;
+    g_pick.wHour = (WORD)hour;
+    g_pick.wMinute = (WORD)minute;
+    g_pick.wSecond = 0;
+    g_pick.wMilliseconds = 0;
+}
+
+static void SetPickTime(__int64 ft)
+{
+    SYSTEMTIME st = FtToSystemTime(ft);
+    g_pick = st;
+    NormalizePick();
+    if (hTimePick) InvalidateRect(hTimePick, NULL, FALSE);
+}
+
+static __int64 GetPickTime()
+{
+    if (g_pick.wYear < 1970) return 0;
+
+    SYSTEMTIME st = g_pick;
     st.wSecond = 0;
     st.wMilliseconds = 0;
     return SystemTimeToFt(st);
 }
 
+static void PickParts(std::wstring parts[5])
+{
+    wchar_t buf[8];
+    swprintf(buf, 8, L"%04d", (int)g_pick.wYear); parts[0] = buf;
+    swprintf(buf, 8, L"%02d", (int)g_pick.wMonth); parts[1] = buf;
+    swprintf(buf, 8, L"%02d", (int)g_pick.wDay); parts[2] = buf;
+    swprintf(buf, 8, L"%02d", (int)g_pick.wHour); parts[3] = buf;
+    swprintf(buf, 8, L"%02d", (int)g_pick.wMinute); parts[4] = buf;
+}
+
+static std::wstring PickFullText()
+{
+    std::wstring parts[5];
+    PickParts(parts);
+    return parts[0] + L"-" + parts[1] + L"-" + parts[2] + L"  " + parts[3] + L":" + parts[4];
+}
+
+static void AdjustPick(int delta)
+{
+    int year = (int)g_pick.wYear;
+    int month = (int)g_pick.wMonth;
+    int day = (int)g_pick.wDay;
+    int hour = (int)g_pick.wHour;
+    int minute = (int)g_pick.wMinute;
+
+    switch (g_pickSeg)
+    {
+        case 0:
+            year += delta;
+            break;
+        case 1:
+            month += delta;
+            if (month > 12) { month = 1; year++; }
+            else if (month < 1) { month = 12; year--; }
+            break;
+        case 2:
+            day += delta;
+            if (day > DaysInMonth(year, month))
+            {
+                day = 1;
+                month++;
+                if (month > 12) { month = 1; year++; }
+            }
+            else if (day < 1)
+            {
+                month--;
+                if (month < 1) { month = 12; year--; }
+                day = DaysInMonth(year, month);
+            }
+            break;
+        case 3:
+            hour += delta;
+            if (hour > 23) hour = 0;
+            else if (hour < 0) hour = 23;
+            break;
+        case 4:
+            minute += delta;
+            if (minute > 59)
+            {
+                minute = 0;
+                hour++;
+                if (hour > 23) hour = 0;
+            }
+            else if (minute < 0)
+            {
+                minute = 59;
+                hour--;
+                if (hour < 0) hour = 23;
+            }
+            break;
+    }
+
+    g_pick.wYear = (WORD)year;
+    g_pick.wMonth = (WORD)month;
+    g_pick.wDay = (WORD)day;
+    g_pick.wHour = (WORD)hour;
+    g_pick.wMinute = (WORD)minute;
+    NormalizePick();
+
+    if (hTimePick) InvalidateRect(hTimePick, NULL, FALSE);
+}
+
+static void LayoutPicker(HWND h)
+{
+    RECT rc;
+    GetClientRect(h, &rc);
+
+    int iconSize = S(16);
+    g_calIconRect.left = rc.left + S(9);
+    g_calIconRect.top = (rc.top + rc.bottom - iconSize) / 2;
+    g_calIconRect.right = g_calIconRect.left + iconSize;
+    g_calIconRect.bottom = g_calIconRect.top + iconSize;
+
+    int spinW = S(24);
+    g_upRect.left = rc.right - spinW;
+    g_upRect.right = rc.right - S(1);
+    g_upRect.top = rc.top + S(1);
+    g_upRect.bottom = (rc.top + rc.bottom) / 2;
+
+    g_downRect.left = g_upRect.left;
+    g_downRect.right = g_upRect.right;
+    g_downRect.top = g_upRect.bottom;
+    g_downRect.bottom = rc.bottom - S(1);
+
+    std::wstring parts[5];
+    PickParts(parts);
+    std::wstring full = PickFullText();
+
+    HDC dc = GetDC(h);
+    HGDIOBJ oldFont = SelectObject(dc, fEdit);
+
+    int textX = g_calIconRect.right + S(10);
+    int top = (rc.top + rc.bottom) / 2 - S(10);
+    int bottom = top + S(20);
+
+    const int startOf[5] = { 0, 5, 8, 12, 15 };
+
+    for (int i = 0; i < 5; i++)
+    {
+        SIZE prefix = {0, 0};
+        if (startOf[i] > 0)
+        {
+            GetTextExtentPoint32W(dc, full.c_str(), startOf[i], &prefix);
+        }
+
+        SIZE seg = {0, 0};
+        GetTextExtentPoint32W(dc, parts[i].c_str(), (int)parts[i].size(), &seg);
+
+        g_segX[i] = textX + prefix.cx;
+        g_segRect[i].left = textX + prefix.cx - S(3);
+        g_segRect[i].right = textX + prefix.cx + seg.cx + S(3);
+        g_segRect[i].top = top;
+        g_segRect[i].bottom = bottom;
+    }
+
+    SelectObject(dc, oldFont);
+    ReleaseDC(h, dc);
+}
+
+static void PaintPicker(HWND h)
+{
+    LayoutPicker(h);
+
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+
+    RECT rc;
+    GetClientRect(h, &rc);
+
+    FillRect(dc, &rc, bSurface);
+
+    bool focused = (GetFocus() == h);
+
+    // 圆角描边（与输入框、按钮统一）
+    HPEN border = CreatePen(PS_SOLID, 1, focused ? C_GREEN : C_LINE);
+    HGDIOBJ oldPen = SelectObject(dc, border);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, rc.left, rc.top, rc.right - 1, rc.bottom - 1, S(8), S(8));
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(border);
+
+    // 选中段的浅绿底
+    if (g_pickSeg >= 0 && g_pickSeg < 5)
+    {
+        RECT sel = g_segRect[g_pickSeg];
+        sel.top += S(3);
+        sel.bottom -= S(3);
+
+        HGDIOBJ sb = SelectObject(dc, bSel);
+        HGDIOBJ sp2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, sel.left, sel.top, sel.right, sel.bottom, S(6), S(6));
+        SelectObject(dc, sp2);
+        SelectObject(dc, sb);
+    }
+
+    // 日历图标
+    COLORREF iconColor = g_hoverCal ? C_GREEN : C_MUTED;
+    HPEN iconPen = CreatePen(PS_SOLID, 1, iconColor);
+    HGDIOBJ prevPen = SelectObject(dc, iconPen);
+    HGDIOBJ prevBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, g_calIconRect.left, g_calIconRect.top + S(3),
+                 g_calIconRect.right, g_calIconRect.bottom);
+    MoveToEx(dc, g_calIconRect.left, g_calIconRect.top + S(7), NULL);
+    LineTo(dc, g_calIconRect.right, g_calIconRect.top + S(7));
+    MoveToEx(dc, g_calIconRect.left + S(4), g_calIconRect.top, NULL);
+    LineTo(dc, g_calIconRect.left + S(4), g_calIconRect.top + S(5));
+    MoveToEx(dc, g_calIconRect.right - S(4), g_calIconRect.top, NULL);
+    LineTo(dc, g_calIconRect.right - S(4), g_calIconRect.top + S(5));
+    SelectObject(dc, prevBrush);
+    SelectObject(dc, prevPen);
+    DeleteObject(iconPen);
+
+    // 文本
+    HGDIOBJ oldFont = SelectObject(dc, fEdit);
+
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    int textY = (rc.top + rc.bottom - tm.tmHeight) / 2;
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_INK);
+    TextOutW(dc, g_segX[0], textY, PickFullText().c_str(), (int)PickFullText().size());
+
+    std::wstring parts[5];
+    PickParts(parts);
+    SetTextColor(dc, C_GREEN);
+    TextOutW(dc, g_segX[g_pickSeg], textY, parts[g_pickSeg].c_str(), (int)parts[g_pickSeg].size());
+
+    SelectObject(dc, oldFont);
+
+    // 微调箭头
+    HPEN sepPen = CreatePen(PS_SOLID, 1, C_LINE);
+    HGDIOBJ sp = SelectObject(dc, sepPen);
+    MoveToEx(dc, g_upRect.left, g_upRect.top + S(2), NULL);
+    LineTo(dc, g_upRect.left, g_downRect.bottom - S(2));
+    SelectObject(dc, sp);
+    DeleteObject(sepPen);
+
+    int cxUp = (g_upRect.left + g_upRect.right) / 2;
+    int cyUp = (g_upRect.top + g_upRect.bottom) / 2;
+    int cxDown = cxUp;
+    int cyDown = (g_downRect.top + g_downRect.bottom) / 2;
+
+    COLORREF upColor = g_hoverUp ? C_GREEN : C_MUTED;
+    COLORREF downColor = g_hoverDown ? C_GREEN : C_MUTED;
+
+    POINT upTri[3] = {
+        { cxUp - S(4), cyUp + S(2) },
+        { cxUp + S(4), cyUp + S(2) },
+        { cxUp,        cyUp - S(3) }
+    };
+    POINT downTri[3] = {
+        { cxDown - S(4), cyDown - S(2) },
+        { cxDown + S(4), cyDown - S(2) },
+        { cxDown,        cyDown + S(3) }
+    };
+
+    HBRUSH upBrush = CreateSolidBrush(upColor);
+    HBRUSH downBrush = CreateSolidBrush(downColor);
+
+    HGDIOBJ b0 = SelectObject(dc, upBrush);
+    HGDIOBJ b1 = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(dc, upTri, 3);
+    SelectObject(dc, downBrush);
+    Polygon(dc, downTri, 3);
+    SelectObject(dc, b1);
+    SelectObject(dc, b0);
+
+    DeleteObject(upBrush);
+    DeleteObject(downBrush);
+
+    EndPaint(h, &ps);
+}
+
+static void CalPrevNextRects()
+{
+    RECT rc;
+    GetClientRect(g_calWnd, &rc);
+
+    int size = S(24);
+    int top = S(7);
+
+    g_calPrevRect.left = rc.left + S(8);
+    g_calPrevRect.top = top;
+    g_calPrevRect.right = g_calPrevRect.left + size;
+    g_calPrevRect.bottom = top + size;
+
+    g_calNextRect.right = rc.right - S(8);
+    g_calNextRect.top = top;
+    g_calNextRect.left = g_calNextRect.right - size;
+    g_calNextRect.bottom = top + size;
+}
+
+static int CalFirstSlot()
+{
+    SYSTEMTIME st;
+    ZeroMemory(&st, sizeof(st));
+    st.wYear = (WORD)g_calYear;
+    st.wMonth = (WORD)g_calMonth;
+    st.wDay = 1;
+
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+
+    SYSTEMTIME out;
+    FileTimeToSystemTime(&ft, &out);
+
+    return (out.wDayOfWeek + 6) % 7;   // 周一为 0
+}
+
+static RECT CalSlotRect(int slot)
+{
+    RECT rc;
+    GetClientRect(g_calWnd, &rc);
+
+    int left = S(10);
+    int top = S(62);
+    int cellW = (rc.right - left - S(10)) / 7;
+    int cellH = S(28);
+
+    int row = slot / 7;
+    int col = slot % 7;
+
+    RECT r;
+    r.left = left + col * cellW + S(2);
+    r.right = r.left + cellW - S(4);
+    r.top = top + row * cellH + S(2);
+    r.bottom = r.top + cellH - S(4);
+    return r;
+}
+
+static void CalShiftMonth(int delta)
+{
+    g_calMonth += delta;
+    if (g_calMonth > 12) { g_calMonth = 1; g_calYear++; }
+    else if (g_calMonth < 1) { g_calMonth = 12; g_calYear--; }
+
+    if (g_calYear < 1970) g_calYear = 1970;
+    if (g_calYear > 2200) g_calYear = 2200;
+
+    g_calHoverDay = -1;
+    InvalidateRect(g_calWnd, NULL, TRUE);
+}
+
+static void PaintCalendar()
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(g_calWnd, &ps);
+
+    RECT rc;
+    GetClientRect(g_calWnd, &rc);
+
+    // 弹层白底 + 圆角描边
+    FillRect(dc, &rc, bSurface);
+
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(214, 219, 226));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, rc.left, rc.top, rc.right - 1, rc.bottom - 1, S(12), S(12));
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+
+    CalPrevNextRects();
+
+    SetBkMode(dc, TRANSPARENT);
+
+    // 标题
+    wchar_t title[64];
+    swprintf(title, 64, L"%d 年 %d 月", g_calYear, g_calMonth);
+
+    HGDIOBJ oldFont = SelectObject(dc, fCap);
+    SetTextColor(dc, C_INK);
+
+    RECT titleRect = { rc.left + S(40), S(9), rc.right - S(40), S(33) };
+    DrawTextW(dc, title, -1, &titleRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // 左右翻月箭头
+    int cy = (g_calPrevRect.top + g_calPrevRect.bottom) / 2;
+    int cxL = (g_calPrevRect.left + g_calPrevRect.right) / 2;
+    int cxR = (g_calNextRect.left + g_calNextRect.right) / 2;
+
+    POINT leftTri[3] = { { cxL + S(3), cy - S(4) }, { cxL + S(3), cy + S(4) }, { cxL - S(3), cy } };
+    POINT rightTri[3] = { { cxR - S(3), cy - S(4) }, { cxR - S(3), cy + S(4) }, { cxR + S(3), cy } };
+
+    HBRUSH arrowBrush = CreateSolidBrush(C_MUTED);
+    HGDIOBJ ab = SelectObject(dc, arrowBrush);
+    HGDIOBJ ap = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(dc, leftTri, 3);
+    Polygon(dc, rightTri, 3);
+    SelectObject(dc, ap);
+    SelectObject(dc, ab);
+    DeleteObject(arrowBrush);
+
+    // 星期表头
+    static const wchar_t* week[7] = { L"一", L"二", L"三", L"四", L"五", L"六", L"日" };
+
+    SelectObject(dc, fState);
+    SetTextColor(dc, RGB(150, 157, 167));
+
+    int gridLeft = S(10);
+    int cellW = (rc.right - gridLeft - S(10)) / 7;
+
+    for (int i = 0; i < 7; i++)
+    {
+        RECT r;
+        r.left = gridLeft + i * cellW;
+        r.right = r.left + cellW;
+        r.top = S(36);
+        r.bottom = S(58);
+        DrawTextW(dc, week[i], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // 日期格：仅选中 / 今天 / 悬停时上色，其余留白
+    int first = CalFirstSlot();
+    int dim = DaysInMonth(g_calYear, g_calMonth);
+
+    SYSTEMTIME today = FtToSystemTime(FtNow());
+
+    for (int d = 1; d <= dim; d++)
+    {
+        int slot = first + d - 1;
+        if (slot >= 42) break;
+
+        RECT r = CalSlotRect(slot);
+        bool selected = (g_pick.wYear == g_calYear && g_pick.wMonth == g_calMonth && g_pick.wDay == d);
+        bool isToday = (today.wYear == g_calYear && today.wMonth == g_calMonth && today.wDay == d);
+        bool hover = (g_calHoverDay == d);
+
+        if (selected || hover || isToday)
+        {
+            RECT mark = r;
+            mark.top += S(1);
+            mark.bottom -= S(1);
+
+            COLORREF fill = selected ? C_GREEN : (hover ? RGB(234, 243, 238) : C_SURFACE);
+            HBRUSH cellBrush = CreateSolidBrush(fill);
+
+            HPEN cellPen = NULL;
+            if (!selected && isToday && !hover)
+            {
+                cellPen = CreatePen(PS_SOLID, 1, C_GREEN);
+            }
+
+            HGDIOBJ cb = SelectObject(dc, cellBrush);
+            HGDIOBJ cp = SelectObject(dc, cellPen ? cellPen : GetStockObject(NULL_PEN));
+            RoundRect(dc, mark.left, mark.top, mark.right, mark.bottom, S(8), S(8));
+            SelectObject(dc, cp);
+            SelectObject(dc, cb);
+            DeleteObject(cellBrush);
+            if (cellPen) DeleteObject(cellPen);
+        }
+
+        wchar_t dayText[8];
+        swprintf(dayText, 8, L"%d", d);
+
+        SelectObject(dc, fState);
+        SetTextColor(dc, selected ? C_SURFACE : (isToday ? C_GREEN : C_INK));
+
+        RECT textRect = r;
+        DrawTextW(dc, dayText, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    SelectObject(dc, oldFont);
+    EndPaint(g_calWnd, &ps);
+}
+
+static void CloseCalendar()
+{
+    if (!g_calWnd) return;
+
+    HWND w = g_calWnd;
+    g_calWnd = NULL;
+    g_calClosedTick = GetTickCount64();
+    DestroyWindow(w);
+}
+
+static void ToggleCalendar()
+{
+    if (g_calWnd)
+    {
+        CloseCalendar();
+        return;
+    }
+
+    // 刚刚因拾取焦点而关闭时，忽略这次点击，避免“关了又开”
+    if (GetTickCount64() - g_calClosedTick < 400) return;
+
+    g_calYear = (int)g_pick.wYear;
+    g_calMonth = (int)g_pick.wMonth;
+    g_calHoverDay = -1;
+
+    RECT pr;
+    GetWindowRect(hTimePick, &pr);
+
+    int w = S(266);
+    int h = S(246);
+    int x = pr.left;
+    int y = pr.bottom + S(4);
+
+    HMONITOR mon = MonitorFromRect(&pr, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi))
+    {
+        if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
+        if (x < mi.rcWork.left) x = mi.rcWork.left;
+        if (y + h > mi.rcWork.bottom) y = pr.top - h - S(4);
+        if (y < mi.rcWork.top) y = mi.rcWork.top;
+    }
+
+    g_calWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"EBCalendar", L"",
+                               WS_POPUP, x, y, w, h, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!g_calWnd) return;
+
+    // 圆角窗口
+    HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, S(14), S(14));
+    SetWindowRgn(g_calWnd, region, TRUE);
+
+    ShowWindow(g_calWnd, SW_SHOW);
+    SetFocus(g_calWnd);
+}
+
+static void CalendarHoverAt(POINT pt)
+{
+    int day = -1;
+
+    int first = CalFirstSlot();
+    int dim = DaysInMonth(g_calYear, g_calMonth);
+
+    for (int d = 1; d <= dim; d++)
+    {
+        int slot = first + d - 1;
+        if (slot >= 42) break;
+
+        RECT r = CalSlotRect(slot);
+        if (PtInRect(&r, pt)) { day = d; break; }
+    }
+
+    if (day != g_calHoverDay)
+    {
+        g_calHoverDay = day;
+        InvalidateRect(g_calWnd, NULL, FALSE);
+    }
+}
+
+static LRESULT CALLBACK CalendarProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg)
+    {
+        case WM_PAINT:
+            PaintCalendar();
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_MOUSEACTIVATE:
+            return MA_ACTIVATE;
+
+        case WM_ACTIVATE:
+            if (LOWORD(w) == WA_INACTIVE) CloseCalendar();
+            return 0;
+
+        case WM_LBUTTONDOWN:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            CalPrevNextRects();
+
+            if (PtInRect(&g_calPrevRect, pt)) { CalShiftMonth(-1); return 0; }
+            if (PtInRect(&g_calNextRect, pt)) { CalShiftMonth(1); return 0; }
+
+            int first = CalFirstSlot();
+            int dim = DaysInMonth(g_calYear, g_calMonth);
+
+            for (int d = 1; d <= dim; d++)
+            {
+                int slot = first + d - 1;
+                if (slot >= 42) break;
+
+                RECT r = CalSlotRect(slot);
+                if (!PtInRect(&r, pt)) continue;
+
+                g_pick.wYear = (WORD)g_calYear;
+                g_pick.wMonth = (WORD)g_calMonth;
+                g_pick.wDay = (WORD)d;
+                NormalizePick();
+
+                if (hTimePick) InvalidateRect(hTimePick, NULL, FALSE);
+                CloseCalendar();
+                return 0;
+            }
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            CalendarHoverAt(pt);
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            if (g_calHoverDay != -1)
+            {
+                g_calHoverDay = -1;
+                InvalidateRect(g_calWnd, NULL, FALSE);
+            }
+            return 0;
+
+        case WM_MOUSEWHEEL:
+            CalShiftMonth(GET_WHEEL_DELTA_WPARAM(w) > 0 ? -1 : 1);
+            return 0;
+
+        case WM_KEYDOWN:
+            if (w == VK_ESCAPE) { CloseCalendar(); return 0; }
+            if (w == VK_LEFT)   { CalShiftMonth(-1); return 0; }
+            if (w == VK_RIGHT)  { CalShiftMonth(1); return 0; }
+            if (w == VK_PRIOR)  { CalShiftMonth(-1); return 0; }
+            if (w == VK_NEXT)   { CalShiftMonth(1); return 0; }
+            return 0;
+    }
+
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static LRESULT CALLBACK TimePickProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg)
+    {
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
+
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(h, NULL, FALSE);
+            return 0;
+
+        case WM_LBUTTONDOWN:
+        {
+            SetFocus(h);
+
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+
+            if (g_calWnd)
+            {
+                CloseCalendar();
+                return 0;
+            }
+
+            if (PtInRect(&g_calIconRect, pt)) { ToggleCalendar(); return 0; }
+            if (PtInRect(&g_upRect, pt))      { AdjustPick(1);   return 0; }
+            if (PtInRect(&g_downRect, pt))    { AdjustPick(-1);  return 0; }
+
+            for (int i = 0; i < 5; i++)
+            {
+                if (PtInRect(&g_segRect[i], pt))
+                {
+                    g_pickSeg = i;
+                    InvalidateRect(h, NULL, FALSE);
+                    break;
+                }
+            }
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL:
+            AdjustPick(GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1);
+            return 0;
+
+        case WM_MOUSEMOVE:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+
+            bool hc = PtInRect(&g_calIconRect, pt) != 0;
+            bool hu = PtInRect(&g_upRect, pt) != 0;
+            bool hd = PtInRect(&g_downRect, pt) != 0;
+
+            if (hc != g_hoverCal || hu != g_hoverUp || hd != g_hoverDown)
+            {
+                g_hoverCal = hc;
+                g_hoverUp = hu;
+                g_hoverDown = hd;
+                InvalidateRect(h, NULL, FALSE);
+            }
+
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = h;
+            tme.dwHoverTime = 0;
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            if (g_hoverCal || g_hoverUp || g_hoverDown)
+            {
+                g_hoverCal = g_hoverUp = g_hoverDown = false;
+                InvalidateRect(h, NULL, FALSE);
+            }
+            return 0;
+
+        case WM_SETCURSOR:
+        {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(h, &pt);
+
+            if (PtInRect(&g_calIconRect, pt) || PtInRect(&g_upRect, pt) || PtInRect(&g_downRect, pt))
+            {
+                SetCursor(LoadCursor(NULL, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        }
+
+        case WM_KEYDOWN:
+            if (w == VK_LEFT)  { g_pickSeg = (g_pickSeg + 4) % 5; InvalidateRect(h, NULL, FALSE); return 0; }
+            if (w == VK_RIGHT) { g_pickSeg = (g_pickSeg + 1) % 5; InvalidateRect(h, NULL, FALSE); return 0; }
+            if (w == VK_UP)    { AdjustPick(1);  return 0; }
+            if (w == VK_DOWN)  { AdjustPick(-1); return 0; }
+            if (w == VK_NEXT)  { AdjustPick(-5); return 0; }
+            if (w == VK_PRIOR) { AdjustPick(5);  return 0; }
+            break;
+
+        case WM_PAINT:
+            PaintPicker(h);
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_DESTROY:
+            CloseCalendar();
+            return 0;
+    }
+
+    return DefWindowProcW(h, msg, w, l);
+}
+
 static void BuildUi()
 {
     // 字体
-    fTitle   = MakeFont(190, true);
+    fTitle   = MakeFont(185, true);
     fSub     = MakeFont(85,  false);
     fClock   = MakeFont(200, true);
     fDate    = MakeFont(85,  false);
     fSync    = MakeFont(85,  false);
     fCount   = MakeFont(115, true);
-    fCap     = MakeFont(90,  false);
+    fCap     = MakeFont(95,  true);
     fEdit    = MakeFont(105, false);
-    fRow     = MakeFont(90,  false);
+    fRow     = MakeFont(95,  false);
     fState   = MakeFont(85,  false);
     fHint    = MakeFont(85,  false);
     fLog     = MakeFont(85,  false);
-    fBtnTool = MakeFont(85,  false);
-    fStart   = MakeFont(150, true);
-    fStop    = MakeFont(160, true);
+    fBtnTool = MakeFont(90,  false);
+    fStart   = MakeFont(145, true);
+    fStop    = MakeFont(150, true);
 
     // 刷子
     bBg         = CreateSolidBrush(C_BG);
@@ -1022,7 +1867,6 @@ static void BuildUi()
     bLine       = CreateSolidBrush(C_LINE);
     bEdit       = CreateSolidBrush(C_SURFACE);
     bSel        = CreateSolidBrush(RGB(234, 243, 238));
-    bSelHover   = CreateSolidBrush(RGB(242, 248, 245));
     bStatePend  = CreateSolidBrush(C_ST_PEND_BG);
     bStatePlay  = CreateSolidBrush(C_ST_PLAY_BG);
     bStateDone  = CreateSolidBrush(C_ST_DONE_BG);
@@ -1047,96 +1891,100 @@ static void BuildUi()
     biDanger.pressed = C_RED_P;
 
     // 顶部
-    hTitle    = MakeStatic(L"考试自动打铃", 24, 8, 320, 40, fTitle, SS_LEFT);
-    hSubtitle = MakeStatic(L"多场考试 · 北京时间基准 · 三段音频自动播放", 26, 48, 500, 22, fSub, SS_LEFT);
-    hCountdown = MakeStatic(L"待启动", 26, 70, 420, 26, fCount, SS_LEFT);
+    hTitle    = MakeStatic(L"考试自动打铃", 24, 10, 320, 40, fTitle, SS_LEFT);
+    hSubtitle = MakeStatic(L"多场考试 · 北京时间基准 · 三段音频自动播放", 26, 49, 500, 22, fSub, SS_LEFT);
+    hCountdown = MakeStatic(L"待启动", 26, 72, 430, 26, fCount, SS_LEFT);
 
-    hClock = MakeStatic(L"--:--:--", 620, 2, 380, 42, fClock, SS_RIGHT);
-    hDate  = MakeStatic(L"北京时间", 620, 44, 380, 20, fDate, SS_RIGHT);
-    hSync  = MakeStatic(L"正在校时…", 620, 66, 274, 22, fSync, SS_RIGHT);
-    hBtnSync = MakeOwnedButton(L"重新校时", 906, 62, 92, 28, &biTool, fBtnTool, ID_SYNC);
+    hClock = MakeStatic(L"--:--:--", 600, 4, 400, 44, fClock, SS_RIGHT);
+    hDate  = MakeStatic(L"北京时间", 620, 50, 380, 20, fDate, SS_RIGHT);
+    hSync  = MakeStatic(L"正在校时…", 620, 72, 272, 22, fSync, SS_RIGHT);
+    hBtnSync = MakeOwnedButton(L"重新校时", 900, 68, 100, 28, &biTool, fBtnTool, ID_SYNC);
 
+    // ------------------------------------------------------------------
     // 考试日程
-    hGrpSet = MakeGroup(L"考试日程", 20, 112, 640, 276);
-
-    hEditName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    // ------------------------------------------------------------------
+    hEditName = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
-                                S(34), S(128), S(178), S(28),
+                                S(kCardExam.x + 14), S(kCardExam.y + 40), S(180), S(30),
                                 g_hwnd, (HMENU)ID_EDIT_NAME, NULL, NULL);
     SendMessageW(hEditName, WM_SETFONT, (WPARAM)fEdit, TRUE);
     SendMessageW(hEditName, EM_SETLIMITTEXT, 40, 0);
+    SendMessageW(hEditName, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(S(8), S(8)));
     SendMessageW(hEditName, EM_SETCUEBANNER, TRUE, (LPARAM)L"考试名称");
     g_editProc = (WNDPROC)SetWindowLongPtrW(hEditName, GWLP_WNDPROC, (LONG_PTR)NameEditProc);
 
-    hDtp = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"",
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | DTS_SHORTDATECENTURYFORMAT,
-                           S(218), S(128), S(196), S(28),
-                           g_hwnd, (HMENU)ID_DTP, NULL, NULL);
-    SendMessageW(hDtp, WM_SETFONT, (WPARAM)fEdit, TRUE);
-    SendMessageW(hDtp, DTM_SETFORMATW, 0, (LPARAM)L"yyyy'-'MM'-'dd  HH':'mm");
-    SetDtpTime(FtFromNowMinutes(30));
+    hTimePick = CreateWindowExW(0, L"EBTimePick", L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                S(kCardExam.x + 202), S(kCardExam.y + 40), S(288), S(30),
+                                g_hwnd, (HMENU)ID_TIME_PICK, NULL, NULL);
+    SendMessageW(hTimePick, WM_SETFONT, (WPARAM)fEdit, TRUE);
+    SetPickTime(FtFromNowMinutes(30));
 
-    hBtnNow = MakeOwnedButton(L"现在 +30", 418, 128, 86, 28, &biTool, fBtnTool, ID_NOW30);
-    hBtnAdd = MakeOwnedButton(L"添加到日程", 510, 128, 116, 28, &biPrimary, fBtnTool, ID_ADD_EXAM);
+    hBtnAdd = MakeOwnedButton(L"添加到日程", kCardExam.x + 498, kCardExam.y + 40, 114, 30,
+                              &biPrimary, fBtnTool, ID_ADD_EXAM);
 
-    hSetHint = MakeStatic(L"填写名称与开始时间（北京时间），可连续添加多场，程序按先后顺序自动打铃",
-                          34, 162, 590, 20, fHint, SS_LEFT);
+    hSetHint = MakeStatic(L"点日历图标选日期，点数字段后用滚轮或右侧箭头微调；启动监测后仍可继续添加",
+                          kCardExam.x + 14, kCardExam.y + 74, 600, 20, fHint, SS_LEFT);
 
-    hExamList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+    hExamList = CreateWindowExW(0, L"LISTBOX", L"",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
                                 LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-                                S(34), S(186), S(592), S(152),
+                                S(kCardExam.x + 14), S(kCardExam.y + 98), S(612), S(156),
                                 g_hwnd, (HMENU)ID_EXAM_LIST, NULL, NULL);
     SendMessageW(hExamList, WM_SETFONT, (WPARAM)fRow, TRUE);
     SendMessageW(hExamList, LB_SETITEMHEIGHT, 0, (LPARAM)S(48));
 
-    hListHint = MakeStatic(L"暂无场次\n填写名称与时间后点击「添加到日程」",
-                           34, 240, 592, 52, fState, SS_CENTER);
-    ShowWindow(hListHint, SW_SHOW);
+    hBtnDel   = MakeOwnedButton(L"删除选中", kCardExam.x + 14, kCardExam.y + 264, 100, 30, &biTool, fBtnTool, ID_DEL_EXAM);
+    hBtnClear = MakeOwnedButton(L"清空日程", kCardExam.x + 122, kCardExam.y + 264, 88, 30, &biTool, fBtnTool, ID_CLEAR_EXAM);
+    hExamCount = MakeStatic(L"共 0 场", kCardExam.x + 400, kCardExam.y + 269, 226, 24, fState, SS_RIGHT);
 
-    hBtnDel   = MakeOwnedButton(L"删除选中", 34, 340, 100, 28, &biTool, fBtnTool, ID_DEL_EXAM);
-    hBtnClear = MakeOwnedButton(L"清空日程", 142, 340, 88, 28, &biTool, fBtnTool, ID_CLEAR_EXAM);
-    hExamCount = MakeStatic(L"共 0 场", 400, 344, 226, 24, fState, SS_RIGHT);
-
+    // ------------------------------------------------------------------
     // 打铃节点
-    hGrpNode = MakeGroup(L"打铃节点", 20, 396, 640, 146);
-    hNodeTitle = MakeStatic(L"未选择场次", 34, 414, 460, 20, fRow, SS_LEFT);
-    MakeStatic(L"节点", 34, 436, 200, 20, fState, SS_LEFT);
-    MakeStatic(L"预定时间", 350, 436, 130, 20, fState, SS_LEFT);
-    MakeStatic(L"状态", 496, 436, 110, 20, fState, SS_LEFT);
+    // ------------------------------------------------------------------
+    hNodeTitle = MakeStatic(L"未选择场次", kCardNode.x + 180, kCardNode.y + 12, 446, 22, fState, SS_RIGHT);
+
+    MakeStatic(L"节点", kCardNode.x + 14, kCardNode.y + 42, 200, 20, fState, SS_LEFT);
+    MakeStatic(L"预定时间", kCardNode.x + 336, kCardNode.y + 42, 130, 20, fState, SS_LEFT);
+    MakeStatic(L"状态", kCardNode.x + 484, kCardNode.y + 42, 110, 20, fState, SS_LEFT);
 
     for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = 456 + i * 26;
-        hNodeName[i]  = MakeStatic(kNodeName[i], 34, y, 306, 24, fRow, SS_LEFT);
-        hNodeTime[i]  = MakeStatic(L"—", 350, y, 130, 24, fRow, SS_LEFT);
-        hNodeState[i] = MakeChip(L"未排期", 494, y, 120, 24, fState);
+        int y = kCardNode.y + 70 + i * 48;
+        hNodeName[i]  = MakeStatic(kNodeName[i], kCardNode.x + 14, y, 310, 26, fRow, SS_LEFT);
+        hNodeTime[i]  = MakeStatic(L"—", kCardNode.x + 336, y, 130, 26, fRow, SS_LEFT);
+        hNodeState[i] = MakeChip(L"未排期", kCardNode.x + 480, y + 1, 120, 24, fState);
     }
 
+    // ------------------------------------------------------------------
     // 音频文件
-    hGrpAudio = MakeGroup(L"音频文件", 20, 548, 640, 124);
-
+    // ------------------------------------------------------------------
     for (int i = 0; i < NODE_COUNT; i++)
     {
-        int y = 562 + i * 32;
-        hAudioCap[i]  = MakeStatic(kNodeShort[i], 34, y, 92, 24, fRow, SS_LEFT);
-        hAudioFile[i] = MakeStatic(L"未选择（点击“选择”添加）", 130, y, 330, 24, fState, SS_LEFT);
-        hBtnPick[i]   = MakeOwnedButton(L"选择", 466, y, 58, 26, &biTool, fBtnTool, ID_PICK0 + i);
-        hBtnPlay[i]   = MakeOwnedButton(L"试听", 530, y, 58, 26, &biTool, fBtnTool, ID_PLAY0 + i);
+        int y = kCardAudio.y + 44 + i * 50;
+
+        // 左侧上下两行：节点名 + 文件名
+        hAudioCap[i]  = MakeStatic(kNodeShort[i], kCardAudio.x + 14, y, 96, 22, fRow, SS_LEFT);
+        hAudioFile[i] = MakeStatic(L"未选择", kCardAudio.x + 14, y + 21, 180, 20,
+                                   fState, SS_LEFT | SS_ENDELLIPSIS);
+
+        // 右侧两个按钮
+        hBtnPick[i] = MakeOwnedButton(L"选择", kCardAudio.x + 202, y + 8, 50, 26, &biTool, fBtnTool, ID_PICK0 + i);
+        hBtnPlay[i] = MakeOwnedButton(L"试听", kCardAudio.x + 258, y + 8, 50, 26, &biTool, fBtnTool, ID_PLAY0 + i);
     }
 
+    // ------------------------------------------------------------------
     // 运行日志
-    hGrpLog = MakeGroup(L"运行日志", 680, 112, 320, 560);
-    hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+    // ------------------------------------------------------------------
+    hLog = CreateWindowExW(0, L"EDIT", L"",
                            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
-                           S(694), S(134), S(292), S(526),
+                           S(kCardLog.x + 14), S(kCardLog.y + 44), S(296), S(286),
                            g_hwnd, (HMENU)ID_LOG, NULL, NULL);
     SendMessageW(hLog, WM_SETFONT, (WPARAM)fLog, TRUE);
 
     // 底部操作
-    hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 690, 320, 56, &biPrimary, fStart, ID_START);
-    hBtnStop  = MakeOwnedButton(L"急  停", 348, 690, 300, 56, &biDanger, fStop, ID_STOP);
-    hFootHint = MakeStatic(L"按 Esc 亦可急停", 664, 706, 336, 24, fHint, SS_RIGHT);
+    hBtnStart = MakeOwnedButton(L"启 动 监 测", 20, 690, 300, 56, &biPrimary, fStart, ID_START);
+    hBtnStop  = MakeOwnedButton(L"急  停", 336, 690, 300, 56, &biDanger, fStop, ID_STOP);
+    hFootHint = MakeStatic(L"按 Esc 亦可急停", 652, 706, 348, 24, fHint, SS_RIGHT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +2077,7 @@ static void UpdateNodePanel()
     if (exam < 0 || exam >= g_examCount)
     {
         SetWindowTextW(hNodeTitle, L"未选择场次");
+
         for (int i = 0; i < NODE_COUNT; i++)
         {
             SetWindowTextW(hNodeTime[i], L"—");
@@ -1239,7 +2088,7 @@ static void UpdateNodePanel()
     }
 
     const Exam& e = g_exam[exam];
-    SetWindowTextW(hNodeTitle, (L"打铃节点 · " + e.name).c_str());
+    SetWindowTextW(hNodeTitle, (L"当前查看：" + e.name).c_str());
 
     const __int64 minute = 60LL * 10000000LL;
 
@@ -1311,7 +2160,9 @@ static void RefreshExamList()
              g_examCount == 0 ? L" · 请先添加" : L"");
     SetWindowTextW(hExamCount, buf);
 
-    ShowWindow(hListHint, g_examCount == 0 ? SW_SHOW : SW_HIDE);
+    // 空日程时隐藏列表，改由主窗口绘制占位提示
+    ShowWindow(hExamList, g_examCount == 0 ? SW_HIDE : SW_SHOW);
+    InvalidateRect(g_hwnd, NULL, FALSE);
 
     if (!g_running)
     {
@@ -1344,6 +2195,7 @@ static void UpdateCountdown()
         if (bestExam < 0)
         {
             SetWindowTextW(hCountdown, L"本轮任务已完成");
+            g_countColor = C_OKTXT;
         }
         else
         {
@@ -1365,15 +2217,18 @@ static void UpdateCountdown()
                 swprintf(buf, 64, L"距下一铃 %02d:%02d", minutes, seconds);
             }
             SetWindowTextW(hCountdown, buf);
+            g_countColor = (totalSeconds <= 60) ? C_BADTXT : C_GREEN;
         }
     }
     else if (g_stoppedByUser)
     {
         SetWindowTextW(hCountdown, L"已急停 · 后续任务已取消");
+        g_countColor = C_BADTXT;
     }
     else
     {
         SetWindowTextW(hCountdown, L"待启动");
+        g_countColor = C_MUTED;
     }
 
     InvalidateRect(hCountdown, NULL, TRUE);
@@ -1447,13 +2302,8 @@ static void CheckAllFinished()
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
-    EnableWindow(hEditName, TRUE);
-    EnableWindow(hDtp, TRUE);
-    EnableWindow(hBtnAdd, TRUE);
-    EnableWindow(hBtnNow, TRUE);
-    EnableWindow(hBtnDel, TRUE);
-    EnableWindow(hBtnClear, TRUE);
-    EnableWindow(hExamList, TRUE);
+    EnableWindow(hBtnDel, g_examCount > 0);
+    EnableWindow(hBtnClear, g_examCount > 0);
 
     Log(L"全部场次任务已结束，可继续添加或重新启动");
     UpdateCountdown();
@@ -1528,6 +2378,37 @@ static void OnTick()
 // ---------------------------------------------------------------------------
 // 启动与急停
 // ---------------------------------------------------------------------------
+
+// 按当前时间为一场景生成三个节点的时刻与初始状态，返回待触发的节点数
+static int PrepareExamNodes(int index)
+{
+    if (index < 0 || index >= g_examCount) return 0;
+
+    const __int64 minute = 60LL * 10000000LL;
+    const __int64 tolerance = 60LL * 10000000LL;
+    __int64 now = FtNow();
+
+    Exam& e = g_exam[index];
+    int pending = 0;
+
+    for (int k = 0; k < NODE_COUNT; k++)
+    {
+        e.nodeFt[k] = e.startFt + (__int64)kNodeOffsetMin[k] * minute;
+
+        if (now - e.nodeFt[k] > tolerance)
+        {
+            e.nodeState[k] = ST_MISS;
+        }
+        else
+        {
+            e.nodeState[k] = ST_PEND;
+            pending++;
+        }
+    }
+
+    return pending;
+}
+
 static void StartMonitoring()
 {
     g_stoppedByUser = false;
@@ -1535,41 +2416,21 @@ static void StartMonitoring()
     g_playKind = -1;
     MciClose();
 
-    __int64 now = FtNow();
-    const __int64 minute = 60LL * 10000000LL;
-    const __int64 tolerance = 60LL * 10000000LL;
-
     int activeNodes = 0;
     int firstActive = -1;
 
     for (int i = 0; i < g_examCount; i++)
     {
-        Exam& e = g_exam[i];
-        bool allPast = true;
+        int pending = PrepareExamNodes(i);
 
-        for (int k = 0; k < NODE_COUNT; k++)
+        if (pending == 0)
         {
-            e.nodeFt[k] = e.startFt + (__int64)kNodeOffsetMin[k] * minute;
-
-            if (now - e.nodeFt[k] > tolerance)
-            {
-                e.nodeState[k] = ST_MISS;
-            }
-            else
-            {
-                e.nodeState[k] = ST_PEND;
-                allPast = false;
-                activeNodes++;
-            }
+            Log(L"跳过已过期：" + g_exam[i].name + L" " + FormatMonthDayHm(g_exam[i].startFt));
         }
-
-        if (allPast)
+        else
         {
-            Log(L"跳过已过期：" + e.name + L" " + FormatMonthDayHm(e.startFt));
-        }
-        else if (firstActive < 0)
-        {
-            firstActive = i;
+            activeNodes += pending;
+            if (firstActive < 0) firstActive = i;
         }
     }
 
@@ -1586,13 +2447,9 @@ static void StartMonitoring()
     SetWindowTextW(hBtnStart, L"运 行 中");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
-    EnableWindow(hEditName, FALSE);
-    EnableWindow(hDtp, FALSE);
-    EnableWindow(hBtnAdd, FALSE);
-    EnableWindow(hBtnNow, FALSE);
+    // 运行中仍可继续排入新场次，只锁定删除类操作
     EnableWindow(hBtnDel, FALSE);
     EnableWindow(hBtnClear, FALSE);
-    EnableWindow(hExamList, FALSE);
 
     wchar_t buf[64];
     swprintf(buf, 64, L"开始监测 · 共 %d 场，%d 个节点待触发", g_examCount, activeNodes);
@@ -1634,13 +2491,8 @@ static void PerformEmergencyStop()
     SetWindowTextW(hBtnStart, L"启 动 监 测");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
-    EnableWindow(hEditName, TRUE);
-    EnableWindow(hDtp, TRUE);
-    EnableWindow(hBtnAdd, TRUE);
-    EnableWindow(hBtnNow, TRUE);
-    EnableWindow(hBtnDel, TRUE);
-    EnableWindow(hBtnClear, TRUE);
-    EnableWindow(hExamList, TRUE);
+    EnableWindow(hBtnDel, g_examCount > 0);
+    EnableWindow(hBtnClear, g_examCount > 0);
 
     Log(L"【急停】已停止播放并取消全部后续任务");
 
@@ -1652,18 +2504,11 @@ static void PerformEmergencyStop()
 static void ResetInputRow()
 {
     SetWindowTextW(hEditName, L"");
-    SetDtpTime(FtFromNowMinutes(30));
+    SetPickTime(FtFromNowMinutes(30));
 }
 
 static void AddExamFromInput()
 {
-    if (g_running)
-    {
-        MessageBoxW(g_hwnd, L"监测进行中，无法修改日程。请先急停或等待本轮结束。",
-                    L"暂不可编辑", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
     if (g_examCount >= MAX_EXAMS)
     {
         wchar_t buf[128];
@@ -1672,7 +2517,7 @@ static void AddExamFromInput()
         return;
     }
 
-    __int64 startFt = GetDtpTime();
+    __int64 startFt = GetPickTime();
 
     wchar_t nameBuf[128] = {0};
     GetWindowTextW(hEditName, nameBuf, 128);
@@ -1700,7 +2545,7 @@ static void AddExamFromInput()
     {
         if (MessageBoxW(g_hwnd,
                         (L"开始时间已过去（当前 " + FormatDateTime(FtNow()) + L"）。\r\n"
-                         L"仍要添加吗？该场次启动后将全部标记为已错过。").c_str(),
+                         L"仍要添加吗？三个打铃时间可能都已过去，将记为已错过。").c_str(),
                         L"时间已过", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
         {
             return;
@@ -1713,6 +2558,31 @@ static void AddExamFromInput()
     if (pos < 0) return;
 
     g_selectedExam = pos;
+
+    if (g_running)
+    {
+        // 监测进行中追加：立即排好该场节点，交给 200ms 轮询统一推进
+        int pending = PrepareExamNodes(pos);
+
+        RefreshExamList();
+        SaveSettings();
+        ResetInputRow();
+        UpdateAllNodeRows();
+        UpdateCountdown();
+
+        if (pending > 0)
+        {
+            Log(L"监测中追加场次：" + name + L" " + FormatMonthDayHm(startFt) +
+                L"（" + std::to_wstring(pending) + L" 个节点待触发）");
+        }
+        else
+        {
+            Log(L"监测中追加场次：" + name + L" " + FormatMonthDayHm(startFt) +
+                L"（打铃时间均已过去，记为已错过）");
+        }
+        return;
+    }
+
     RefreshExamList();
     SaveSettings();
     ResetInputRow();
@@ -1931,13 +2801,29 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
     }
 
     bool selected = (d->itemState & ODS_SELECTED) != 0;
-    bool focused  = (d->itemState & ODS_FOCUS) != 0;
 
-    HBRUSH fill = selected ? bSel : (focused ? bSelHover : bSurface);
-    FillRect(d->hDC, &r, fill);
+    FillRect(d->hDC, &r, bSurface);
 
-    // 分隔线
-    HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
+    // 选中行：圆角浅绿底
+    if (selected)
+    {
+        RECT pill = r;
+        pill.left += S(4);
+        pill.right -= S(4);
+        pill.top += S(2);
+        pill.bottom -= S(2);
+
+        HBRUSH brush = CreateSolidBrush(RGB(238, 246, 241));
+        HGDIOBJ ob = SelectObject(d->hDC, brush);
+        HGDIOBJ op = SelectObject(d->hDC, GetStockObject(NULL_PEN));
+        RoundRect(d->hDC, pill.left, pill.top, pill.right, pill.bottom, S(8), S(8));
+        SelectObject(d->hDC, op);
+        SelectObject(d->hDC, ob);
+        DeleteObject(brush);
+    }
+
+    // 底部分隔线
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(240, 242, 245));
     HGDIOBJ oldPen = SelectObject(d->hDC, pen);
     MoveToEx(d->hDC, r.left + S(12), r.bottom - 1, NULL);
     LineTo(d->hDC, r.right - S(12), r.bottom - 1);
@@ -1949,9 +2835,9 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
     SetBkMode(d->hDC, TRANSPARENT);
 
     RECT nameRect = r;
-    nameRect.left += S(12);
+    nameRect.left += S(14);
     nameRect.right -= S(96);
-    nameRect.top += S(6);
+    nameRect.top += S(7);
     nameRect.bottom = nameRect.top + S(20);
 
     HGDIOBJ oldFont = SelectObject(d->hDC, fRow);
@@ -1959,7 +2845,7 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
     DrawTextW(d->hDC, e.name.c_str(), -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     RECT timeRect = nameRect;
-    timeRect.top = nameRect.bottom + S(2);
+    timeRect.top = nameRect.bottom + S(1);
     timeRect.bottom = timeRect.top + S(18);
 
     SelectObject(d->hDC, fState);
@@ -1972,7 +2858,7 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
     const wchar_t* text = ExamStatusText(index);
 
     RECT chip;
-    chip.right = r.right - S(12);
+    chip.right = r.right - S(14);
     chip.left = chip.right - S(74);
     chip.top = r.top + (r.bottom - r.top - S(24)) / 2;
     chip.bottom = chip.top + S(24);
@@ -1981,7 +2867,7 @@ static void DrawExamListItem(LPDRAWITEMSTRUCT d)
     HGDIOBJ oldBrush = SelectObject(d->hDC, chipBrush);
     HPEN chipPen = CreatePen(PS_SOLID, 1, StateBgColor(state));
     HGDIOBJ prevPen = SelectObject(d->hDC, chipPen);
-    RoundRect(d->hDC, chip.left, chip.top, chip.right, chip.bottom, S(10), S(10));
+    RoundRect(d->hDC, chip.left, chip.top, chip.right, chip.bottom, S(12), S(12));
     SelectObject(d->hDC, prevPen);
     SelectObject(d->hDC, oldBrush);
     DeleteObject(chipPen);
@@ -2005,27 +2891,37 @@ static void DrawOwnedButton(LPDRAWITEMSTRUCT d)
     COLORREF fill;
     if (disabled)
     {
-        fill = (info->kind == BTN_TOOL) ? C_SURFACE : RGB(226, 229, 234);
+        fill = (info->kind == BTN_TOOL) ? RGB(247, 248, 250) : RGB(226, 229, 234);
     }
     else
     {
         fill = pressed ? info->pressed : info->normal;
     }
 
+    RECT r = d->rcItem;
+    int radius = S(8);
+
     HBRUSH brush = CreateSolidBrush(fill);
-    FillRect(d->hDC, &d->rcItem, brush);
-    DeleteObject(brush);
+    HGDIOBJ ob = SelectObject(d->hDC, brush);
+    HGDIOBJ op;
 
     if (info->kind == BTN_TOOL)
     {
         HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
-        HGDIOBJ oldPen = SelectObject(d->hDC, pen);
-        HGDIOBJ oldBrush = SelectObject(d->hDC, GetStockObject(NULL_BRUSH));
-        Rectangle(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom);
-        SelectObject(d->hDC, oldBrush);
-        SelectObject(d->hDC, oldPen);
+        op = SelectObject(d->hDC, pen);
+        RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, radius, radius);
+        SelectObject(d->hDC, op);
         DeleteObject(pen);
     }
+    else
+    {
+        op = SelectObject(d->hDC, GetStockObject(NULL_PEN));
+        RoundRect(d->hDC, r.left, r.top, r.right, r.bottom, radius, radius);
+        SelectObject(d->hDC, op);
+    }
+
+    SelectObject(d->hDC, ob);
+    DeleteObject(brush);
 
     wchar_t text[160] = {0};
     GetWindowTextW(d->hwndItem, text, 160);
@@ -2041,12 +2937,12 @@ static void DrawOwnedButton(LPDRAWITEMSTRUCT d)
         SetTextColor(d->hDC, disabled ? RGB(128, 135, 146) : RGB(255, 255, 255));
     }
 
-    HFONT font = (info->kind == BTN_PRIMARY) ? fStart
-               : (info->kind == BTN_DANGER)  ? fStop
-               : fBtnTool;
+    // 大号按钮用粗体大字，小号（如添加到日程）沿用工具栏字号
+    bool big = (r.bottom - r.top) > S(40);
+
+    HFONT font = big ? (info->kind == BTN_PRIMARY ? fStart : fStop) : fBtnTool;
 
     HGDIOBJ oldFont = SelectObject(d->hDC, font);
-    RECT r = d->rcItem;
     DrawTextW(d->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(d->hDC, oldFont);
 }
@@ -2114,7 +3010,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         FillRect(dc, &client, bBg);
 
         RECT header = client;
-        header.bottom = S(100);
+        header.bottom = S(104);
         FillRect(dc, &header, bSurface);
 
         RECT footer = client;
@@ -2123,12 +3019,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
         HGDIOBJ oldPen = SelectObject(dc, pen);
-        MoveToEx(dc, 0, S(100) - 1, NULL);
-        LineTo(dc, client.right, S(100) - 1);
+        MoveToEx(dc, 0, S(104) - 1, NULL);
+        LineTo(dc, client.right, S(104) - 1);
         MoveToEx(dc, 0, S(682), NULL);
         LineTo(dc, client.right, S(682));
         SelectObject(dc, oldPen);
         DeleteObject(pen);
+
+        // 四张卡片
+        DrawCard(dc, kCardExam,  L"考试日程");
+        DrawCard(dc, kCardNode,  L"打铃节点");
+        DrawCard(dc, kCardAudio, L"音频文件");
+        DrawCard(dc, kCardLog,   L"运行日志");
+
+        // 输入框外框（子窗口自身无边框，这里补一圈圆角描边）
+        DrawFieldFrame(dc, hEditName);
+        DrawFieldFrame(dc, hExamList);
+        DrawFieldFrame(dc, hLog);
+
+        // 空日程占位
+        if (g_examCount == 0 && hExamList)
+        {
+            RECT lr;
+            GetWindowRect(hExamList, &lr);
+            POINT tl = { lr.left, lr.top };
+            POINT br = { lr.right, lr.bottom };
+            ScreenToClient(hwnd, &tl);
+            ScreenToClient(hwnd, &br);
+
+            RECT box = { tl.x, tl.y, br.x, br.y };
+            int midY = (box.top + box.bottom) / 2;
+
+            RECT line1 = { box.left, midY - S(20), box.right, midY + S(2) };
+            RECT line2 = { box.left, midY + S(2), box.right, midY + S(24) };
+
+            HGDIOBJ oldFont = SelectObject(dc, fRow);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, C_MUTED);
+            DrawTextW(dc, L"暂无场次", -1, &line1, DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
+            SelectObject(dc, oldFont);
+
+            oldFont = SelectObject(dc, fState);
+            SetTextColor(dc, RGB(150, 157, 167));
+            DrawTextW(dc, L"填写考试名称与开始时间后，点「添加到日程」", -1, &line2,
+                      DT_CENTER | DT_SINGLELINE | DT_TOP);
+            SelectObject(dc, oldFont);
+        }
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -2139,19 +3075,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HDC dc = (HDC)wParam;
         HWND control = (HWND)lParam;
 
-        bool onHeader = (control == hTitle || control == hSubtitle || control == hClock ||
-                         control == hDate  || control == hSync     || control == hCountdown);
-
-        bool onSurface = onHeader || control == hListHint;
-
         SetBkMode(dc, OPAQUE);
-        SetBkColor(dc, onSurface ? C_SURFACE : C_BG);
+        SetBkColor(dc, C_SURFACE);
 
         if (control == hSync) SetTextColor(dc, g_syncTextColor);
-        else if (control == hSubtitle || control == hDate || control == hListHint) SetTextColor(dc, C_MUTED);
+        else if (control == hCountdown) SetTextColor(dc, g_countColor);
+        else if (control == hSubtitle || control == hDate || control == hSetHint ||
+                 control == hExamCount || control == hFootHint ||
+                 control == hAudioFile[0] || control == hAudioFile[1] || control == hAudioFile[2] ||
+                 control == hNodeTitle)
+            SetTextColor(dc, C_MUTED);
         else SetTextColor(dc, C_INK);
 
-        return (LRESULT)(onSurface ? bSurface : bBg);
+        return (LRESULT)bSurface;
     }
 
     case WM_CTLCOLOREDIT:
@@ -2259,12 +3195,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (id == ID_SYNC && code == BN_CLICKED)
         {
             StartSyncThread();
-            return 0;
-        }
-
-        if (id == ID_NOW30 && code == BN_CLICKED)
-        {
-            SetDtpTime(FtFromNowMinutes(30));
             return 0;
         }
 
@@ -2428,6 +3358,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     wc.hbrBackground = CreateSolidBrush(C_BG);
     wc.lpszClassName = L"ExamBellWindow";
     RegisterClassExW(&wc);
+
+    // 自绘时间选择器
+    WNDCLASSEXW pc;
+    ZeroMemory(&pc, sizeof(pc));
+    pc.cbSize = sizeof(pc);
+    pc.style = CS_HREDRAW | CS_VREDRAW;
+    pc.lpfnWndProc = TimePickProc;
+    pc.hInstance = instance;
+    pc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    pc.hbrBackground = NULL;
+    pc.lpszClassName = L"EBTimePick";
+    RegisterClassExW(&pc);
+
+    // 弹出月历
+    WNDCLASSEXW cc;
+    ZeroMemory(&cc, sizeof(cc));
+    cc.cbSize = sizeof(cc);
+    cc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
+    cc.lpfnWndProc = CalendarProc;
+    cc.hInstance = instance;
+    cc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    cc.hbrBackground = NULL;
+    cc.lpszClassName = L"EBCalendar";
+    RegisterClassExW(&cc);
 
     RECT rc = { 0, 0, S(1020), S(760) };
     AdjustWindowRectEx(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
