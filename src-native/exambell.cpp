@@ -291,19 +291,13 @@ static bool FileExists(const std::wstring& path)
     return GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attr) != 0;
 }
 
-static void Log(const std::wstring& message)
-{
-    if (!hLog) return;
-    std::wstring line = L"[" + FormatTime(FtNow()) + L"] " + message + L"\r\n";
-    SendMessageW(hLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-    SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
-    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
-}
+static void Log(const std::wstring& message);
 
 // ---------------------------------------------------------------------------
-// 配置读写（%APPDATA%\ExamBell\config.ini，UTF-8）
+// 运行日志落盘（%APPDATA%\ExamBell\exam_bell.log）
+//   考试现场出事需要事后追查，UI 里的日志会被清掉，文件里的不会
 // ---------------------------------------------------------------------------
-static std::wstring ConfigPath()
+static std::wstring AppDir()
 {
     wchar_t dir[MAX_PATH] = L"C:\\";
     if (GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH) == 0)
@@ -313,7 +307,99 @@ static std::wstring ConfigPath()
 
     std::wstring folder = std::wstring(dir) + L"\\ExamBell";
     CreateDirectoryW(folder.c_str(), NULL);
-    return folder + L"\\config.ini";
+    return folder;
+}
+
+static std::wstring LogFilePath()
+{
+    return AppDir() + L"\\exam_bell.log";
+}
+
+// 日志超过 2 MB 就滚动一份 .1，避免长期运行把磁盘写满
+static void RotateLogIfNeeded()
+{
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (!GetFileAttributesExW(LogFilePath().c_str(), GetFileExInfoStandard, &attr)) return;
+
+    ULARGE_INTEGER size;
+    size.LowPart = attr.nFileSizeLow;
+    size.HighPart = attr.nFileSizeHigh;
+    if (size.QuadPart < 2u * 1024u * 1024u) return;
+
+    std::wstring path = LogFilePath();
+    MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+static void AppendLogFile(const std::wstring& line)
+{
+    RotateLogIfNeeded();
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t stamp[64];
+    swprintf(stamp, 64, L"%04d-%02d-%02d %02d:%02d:%02d  ",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring text = std::wstring(stamp) + line + L"\r\n";
+
+    int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), NULL, 0, NULL, NULL);
+    if (need <= 0) return;
+
+    std::string utf8((size_t)need, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[0], need, NULL, NULL);
+
+    HANDLE file = CreateFileW(LogFilePath().c_str(), FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    DWORD written = 0;
+    WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+    CloseHandle(file);
+}
+
+// 未捕获异常：先把现场写进日志，再让系统走默认流程
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* info)
+{
+    wchar_t buf[256];
+    DWORD code = (info && info->ExceptionRecord) ? info->ExceptionRecord->ExceptionCode : 0;
+    void* addr = (info && info->ExceptionRecord) ? info->ExceptionRecord->ExceptionAddress : NULL;
+
+    swprintf(buf, 256, L"【崩溃】异常码 0x%08X，地址 %p", (unsigned)code, addr);
+    AppendLogFile(buf);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void Log(const std::wstring& message)
+{
+    AppendLogFile(message);
+
+    if (!hLog) return;
+    std::wstring line = L"[" + FormatTime(FtNow()) + L"] " + message + L"\r\n";
+    SendMessageW(hLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
+
+    // UI 日志过长会拖慢重绘，超过 500 行就清一次，文件里仍保留完整记录
+    static int uiLines = 0;
+    uiLines++;
+    if (uiLines > 500)
+    {
+        uiLines = 1;
+        SetWindowTextW(hLog, L"");
+        std::wstring tip = L"[" + FormatTime(FtNow()) + L"] （界面日志已折叠，完整记录见 exam_bell.log）\r\n";
+        SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)tip.c_str());
+        SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 配置读写（%APPDATA%\ExamBell\config.ini，UTF-8）
+// ---------------------------------------------------------------------------
+static std::wstring ConfigPath()
+{
+    return AppDir() + L"\\config.ini";
 }
 
 static std::wstring Trim(const std::wstring& s)
@@ -371,12 +457,28 @@ static void SaveSettings()
         WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[base], need, NULL, NULL);
     }
 
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    // 先写临时文件再原子替换，避免掉电 / 崩溃把原配置截断成半截
+    std::wstring temp = path + L".tmp";
+    HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, NULL,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE) return;
 
     DWORD written = 0;
-    WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+    BOOL ok = WriteFile(file, utf8.data(), (DWORD)utf8.size(), &written, NULL);
+    ok = ok && (written == (DWORD)utf8.size());
+    FlushFileBuffers(file);
     CloseHandle(file);
+
+    if (!ok)
+    {
+        DeleteFileW(temp.c_str());
+        return;
+    }
+
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        DeleteFileW(temp.c_str());
+    }
 }
 
 // 距当前若干分钟的整分钟时刻（秒固定为 0）
@@ -2324,53 +2426,88 @@ static void UpdateCountdown()
 // ---------------------------------------------------------------------------
 // 打铃调度
 // ---------------------------------------------------------------------------
+// 同一时刻可能有多个节点到点（多场考试同时开始，或上一段还没播完）。
+// 早期实现会直接打断上一段，导致播报被截断；这里改为排队，逐段放完。
+struct BellItem { int exam; int kind; };
+
+static std::vector<BellItem> g_bellQueue;
+static ULONGLONG g_playStartTick = 0;   // 本段开始播放的时刻，用于看门狗
+static bool      g_playVerified  = false;
+
+// 真正启动一段播放；返回 false 表示应改用提示音兜底
+static bool StartBellAudio(int kind)
+{
+    std::wstring file = g_audio[kind];
+    if (file.empty())
+    {
+        Log(L"未设置音频文件，改用系统提示音");
+        return false;
+    }
+
+    if (!FileExists(file))
+    {
+        Log(L"音频文件不存在：" + file);
+        return false;
+    }
+
+    if (!MciPlay(file))
+    {
+        Log(L"音频播放失败，改用系统提示音");
+        return false;
+    }
+
+    return true;
+}
+
+static void PumpBellQueue()
+{
+    if (g_playExam >= 0) return;   // 正在播，等它结束后再取下一段
+
+    while (!g_bellQueue.empty())
+    {
+        BellItem item = g_bellQueue.front();
+        g_bellQueue.erase(g_bellQueue.begin());
+
+        if (item.exam < 0 || item.exam >= g_examCount) continue;
+
+        if (StartBellAudio(item.kind))
+        {
+            g_playExam      = item.exam;
+            g_playKind      = item.kind;
+            g_playStartTick = GetTickCount64();
+            g_playVerified  = false;
+            UpdateAllNodeRows();
+            return;
+        }
+
+        // 兜底：系统提示音，并立即收尾，不能因为没声音就卡住队列
+        MessageBeep(MB_ICONEXCLAMATION);
+
+        if (g_exam[item.exam].nodeState[item.kind] == ST_PLAY)
+        {
+            g_exam[item.exam].nodeState[item.kind] = ST_DONE;
+        }
+        UpdateAllNodeRows();
+    }
+}
+
 static void TriggerBell(int exam, int kind)
 {
     if (exam < 0 || exam >= g_examCount) return;
+    if (kind < 0 || kind >= NODE_COUNT) return;
 
     Exam& e = g_exam[exam];
-
-    // 上一段还没播完，直接按完成处理，避免状态卡在“播放中”
-    if (g_playExam >= 0 && g_playExam < g_examCount &&
-        g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
-    {
-        g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
-    }
-    g_playExam = -1;
-    g_playKind = -1;
 
     e.nodeState[kind] = ST_PLAY;
     UpdateAllNodeRows();
     Log(L"打铃：" + e.name + L" · " + NodeName(kind));
 
-    std::wstring file = g_audio[kind];
-
-    if (!file.empty())
-    {
-        if (FileExists(file))
-        {
-            if (MciPlay(file))
-            {
-                g_playExam = exam;
-                g_playKind = kind;
-                return;
-            }
-            Log(L"音频播放失败，改用系统提示音");
-        }
-        else
-        {
-            Log(L"音频文件不存在：" + file);
-        }
-    }
-    else
-    {
-        Log(L"未设置音频文件，改用系统提示音");
-    }
-
-    MessageBeep(MB_ICONEXCLAMATION);
-    e.nodeState[kind] = ST_DONE;
-    UpdateAllNodeRows();
+    g_bellQueue.push_back(BellItem{ exam, kind });
+    PumpBellQueue();
 }
+
+// 监测期间阻止系统休眠 / 关闭显示器，避免到点不响
+static void SetAwake(bool on);
 
 // 空闲时降低轮询频率（1s），监测中保持 200ms，兼顾精度与功耗
 static void ApplyTimerMode();
@@ -2388,6 +2525,7 @@ static void CheckAllFinished()
     if (!g_running) return;
 
     g_running = false;
+    SetAwake(false);
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启动监测");
     InvalidateRect(hBtnStart, NULL, TRUE);
@@ -2411,18 +2549,61 @@ static void OnTick()
     if (clockText != lastClock) { lastClock = clockText; SetWindowTextW(hClock, clockText.c_str()); }
     if (dateText  != lastDate)  { lastDate  = dateText;  SetWindowTextW(hDate,  dateText.c_str());  }
 
-    // 播放结束检测
-    if (g_playExam >= 0 && !MciIsPlaying())
+    // 播放结束检测 + 看门狗
+    if (g_playExam >= 0)
     {
-        if (g_playExam < g_examCount && g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+        bool playing = MciIsPlaying();
+
+        if (playing) g_playVerified = true;
+
+        // MCI 刚 open 的那一瞬间可能还没报告 playing，先给它一点时间，
+        // 否则会把刚开始没多久的音频误判为“已播完”。
+        ULONGLONG elapsed = GetTickCount64() - g_playStartTick;
+        bool graceOver = elapsed > 1200;
+
+        if (g_playVerified && !playing)
         {
-            g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
-            Log(L"播放结束：" + g_exam[g_playExam].name + L" · " + NodeName(g_playKind));
+            if (g_playExam < g_examCount &&
+                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            {
+                g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+                Log(L"播放结束：" + g_exam[g_playExam].name + L" · " + NodeName(g_playKind));
+            }
+            g_playExam = -1;
+            g_playKind = -1;
+            UpdateAllNodeRows();
         }
-        g_playExam = -1;
-        g_playKind = -1;
-        UpdateAllNodeRows();
+        else if (!g_playVerified && graceOver && !playing)
+        {
+            // 一直没进入播放状态，按失败收尾，避免卡住整条队列
+            Log(L"音频未能进入播放状态，已跳过");
+            if (g_playExam < g_examCount &&
+                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            {
+                g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+            }
+            g_playExam = -1;
+            g_playKind = -1;
+            UpdateAllNodeRows();
+        }
+        else if (elapsed > 10u * 60u * 1000u)
+        {
+            // 看门狗：一段音频超过 10 分钟仍在“播放”，多半是设备被拔掉 / 驱动卡死
+            Log(L"音频播放超时（超过 10 分钟），强制结束并继续后续节点");
+            MciClose();
+            if (g_playExam < g_examCount &&
+                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            {
+                g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
+            }
+            g_playExam = -1;
+            g_playKind = -1;
+            UpdateAllNodeRows();
+        }
     }
+
+    // 空闲出来就取下一段排队的铃声
+    PumpBellQueue();
 
     if (!g_running)
     {
@@ -2513,11 +2694,25 @@ static int PrepareExamNodes(int index)
     return pending;
 }
 
+// 监测期间阻止系统休眠 / 关闭显示器，避免到点不响
+static void SetAwake(bool on)
+{
+    static bool awake = false;
+    if (on == awake) return;
+
+    awake = on;
+    SetThreadExecutionState(on
+                            ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+                            : ES_CONTINUOUS);
+}
+
 static void StartMonitoring()
 {
     g_stoppedByUser = false;
     g_playExam = -1;
     g_playKind = -1;
+    g_bellQueue.clear();
+    g_playVerified = false;
     MciClose();
 
     int activeNodes = 0;
@@ -2546,6 +2741,7 @@ static void StartMonitoring()
     }
 
     g_running = true;
+    SetAwake(true);
 
     EnableWindow(hBtnStart, FALSE);
     SetWindowTextW(hBtnStart, L"监测中");
@@ -2577,6 +2773,8 @@ static void PerformEmergencyStop()
     MciClose();
     g_playExam = -1;
     g_playKind = -1;
+    g_bellQueue.clear();
+    g_playVerified = false;
 
     for (int i = 0; i < g_examCount; i++)
     {
@@ -3467,6 +3665,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return TRUE;
 
+    case WM_APP + 21:
+        // 第二次启动时被唤起：提示窗而不是默默无闻
+        FlashWindow(hwnd, TRUE);
+        SetForegroundWindow(hwnd);
+        return 0;
+
     case WM_CLOSE:
         if (g_running)
         {
@@ -3516,7 +3720,36 @@ static void CenterWindow(HWND hwnd)
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
 {
+    // 单实例：同一台机器只能有一份在跑。
+    // 若允许开两份，同一个节点会被两个进程各响一次，考场会听到双响。
+    // 注意用 Local\ 而非 Global\：Global 命名空间在非管理员会话下会创建失败并返回
+    // NULL，那样检测就被静默跳过了。互斥量只覆盖本会话，因此再叠一层窗口查找。
+    HANDLE mutex = CreateMutexW(NULL, FALSE, L"Local\\ExamBell_SingleInstance");
+    bool  mutexDup = (mutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS);
+
+    HWND existing = FindWindowW(L"ExamBellWindow", NULL);
+
+    if (mutexDup || existing)
+    {
+        if (existing)
+        {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            PostMessageW(existing, WM_APP + 21, 0, 0);   // 让已有窗口闪一下，提示用户
+        }
+
+        MessageBoxW(NULL,
+                    L"考试自动打铃已在运行，请勿重复打开。\n\n"
+                    L"重复运行会导致同一时刻响两次铃。",
+                    L"已在运行", MB_OK | MB_ICONWARNING);
+        if (mutex) CloseHandle(mutex);
+        return 0;
+    }
+
     SetProcessDPIAware();
+
+    // 崩溃也要留证据
+    SetUnhandledExceptionFilter(CrashHandler);
 
     HDC screen = GetDC(NULL);
     g_dpi = GetDeviceCaps(screen, LOGPIXELSX);
