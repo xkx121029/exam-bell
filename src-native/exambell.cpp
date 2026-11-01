@@ -2476,25 +2476,36 @@ static int NodeStateAt(int kind)
     return ST_NONE;
 }
 
+// 文本没变就不碰控件：SetWindowText 会触发子控件重画，老机器上每秒多次很浪费
+static void SetTextIfChanged(HWND h, const std::wstring& text)
+{
+    wchar_t buf[128];
+    int n = GetWindowTextW(h, buf, 128);
+    if (n < 0) n = 0;
+    if (text.size() < 128 && (size_t)n == text.size() && text.compare(0, text.size(), buf) == 0) return;
+
+    SetWindowTextW(h, text.c_str());
+    InvalidateRect(h, NULL, TRUE);
+}
+
 static void UpdateNodePanel()
 {
     int exam = g_selectedExam;
 
     if (exam < 0 || exam >= g_examCount)
     {
-        SetWindowTextW(hNodeTitle, L"未选择场次");
+        SetTextIfChanged(hNodeTitle, L"未选择场次");
 
         for (int i = 0; i < NODE_COUNT; i++)
         {
-            SetWindowTextW(hNodeTime[i], L"—");
-            SetWindowTextW(hNodeState[i], L"未排期");
-            InvalidateRect(hNodeState[i], NULL, TRUE);
+            SetTextIfChanged(hNodeTime[i], L"—");
+            SetTextIfChanged(hNodeState[i], L"未排期");
         }
         return;
     }
 
     const Exam& e = g_exam[exam];
-    SetWindowTextW(hNodeTitle, (L"当前查看：" + e.name).c_str());
+    SetTextIfChanged(hNodeTitle, L"当前查看：" + e.name);
 
     const __int64 minute = 60LL * 10000000LL;
 
@@ -2505,38 +2516,65 @@ static void UpdateNodePanel()
                      ? e.startFt + (__int64)NodeOffsetMin(i) * minute
                      : e.nodeFt[i];
 
-        SetWindowTextW(hNodeTime[i], FormatMonthDayHm(ft).c_str());
-        SetWindowTextW(hNodeState[i],
-                       (state == ST_NONE) ? L"未开始" : StateText(state));
-        InvalidateRect(hNodeState[i], NULL, TRUE);
-        InvalidateRect(hNodeTime[i], NULL, TRUE);
+        SetTextIfChanged(hNodeTime[i], FormatMonthDayHm(ft));
+        SetTextIfChanged(hNodeState[i],
+                         (state == ST_NONE) ? L"未开始" : StateText(state));
     }
 }
 
 static void UpdateAllNodeRows()
 {
     UpdateNodePanel();
-    InvalidateRect(hExamList, NULL, TRUE);
+    InvalidateRect(hExamList, NULL, FALSE);
 }
 
 static void UpdateAudioLabel(int index)
 {
-    if (g_audio[index].empty() || !FileExists(g_audio[index]))
+    std::wstring text;
+    if (g_audio[index].empty())
     {
-        if (g_audio[index].empty())
-        {
-            SetWindowTextW(hAudioFile[index], L"未选择");
-        }
-        else
-        {
-            SetWindowTextW(hAudioFile[index], (L"缺失：" + FileNameOf(g_audio[index])).c_str());
-        }
+        text = L"未选择";
+    }
+    else if (!FileExists(g_audio[index]))
+    {
+        text = L"缺失：" + FileNameOf(g_audio[index]);
     }
     else
     {
-        SetWindowTextW(hAudioFile[index], FileNameOf(g_audio[index]).c_str());
+        text = FileNameOf(g_audio[index]);
     }
-    InvalidateRect(hAudioFile[index], NULL, TRUE);
+
+    SetTextIfChanged(hAudioFile[index], text);
+}
+
+// 空闲时只有“按时间推导出来的状态”可能变化（如节点过期变成已错过）。
+// 逐项比对后再决定是否重画，避免老机器上每几秒无谓重绘整份日程列表。
+static void RefreshDerivedStatesIfChanged()
+{
+    static int lastExam[MAX_EXAMS];
+    static int lastNode[NODE_COUNT];
+    static bool inited = false;
+
+    bool changed = !inited;
+    inited = true;
+
+    for (int i = 0; i < g_examCount; i++)
+    {
+        int s = ExamDisplayState(i);
+        if (s != lastExam[i]) { lastExam[i] = s; changed = true; }
+    }
+    for (int i = g_examCount; i < MAX_EXAMS; i++) lastExam[i] = -99;
+
+    for (int i = 0; i < NODE_COUNT; i++)
+    {
+        int s = NodeStateAt(i);
+        if (s != lastNode[i]) { lastNode[i] = s; changed = true; }
+    }
+
+    if (!changed) return;
+
+    UpdateNodePanel();
+    InvalidateRect(hExamList, NULL, FALSE);
 }
 
 // 监测进行中锁定间隔设置：中途改间隔会让已排好的节点时刻失去意义
@@ -2881,12 +2919,25 @@ static void OnTick()
 {
     __int64 now = FtNow();
 
-    // 仅在文本变化时刷新，避免无谓重绘
-    static std::wstring lastClock, lastDate;
-    std::wstring clockText = FormatTime(now);
-    std::wstring dateText  = FormatDate(now);
-    if (clockText != lastClock) { lastClock = clockText; SetWindowTextW(hClock, clockText.c_str()); }
-    if (dateText  != lastDate)  { lastDate  = dateText;  SetWindowTextW(hDate,  dateText.c_str());  }
+    // 时钟/日期按“秒”“日”门控：监测期间 200 ms 轮询也不必反复重建字符串
+    static SYSTEMTIME lastSt = {0};
+    static bool lastStValid = false;
+    SYSTEMTIME st = FtToSystemTime(now);
+    if (!lastStValid || st.wSecond != lastSt.wSecond || st.wMinute != lastSt.wMinute || st.wHour != lastSt.wHour)
+    {
+        wchar_t buf[32];
+        swprintf(buf, 32, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        SetWindowTextW(hClock, buf);
+    }
+    if (!lastStValid || st.wDay != lastSt.wDay || st.wMonth != lastSt.wMonth || st.wYear != lastSt.wYear)
+    {
+        static const wchar_t* week[7] = { L"日", L"一", L"二", L"三", L"四", L"五", L"六" };
+        wchar_t buf[64];
+        swprintf(buf, 64, L"%04d-%02d-%02d  星期%ls　", st.wYear, st.wMonth, st.wDay, week[st.wDayOfWeek % 7]);
+        SetWindowTextW(hDate, buf);
+    }
+    lastSt = st;
+    lastStValid = true;
 
     // 播放结束检测 + 看门狗
     if (g_playExam >= 0)
@@ -2944,14 +2995,14 @@ static void OnTick()
 
     if (!g_running)
     {
-        // 空闲时也定期刷新，让“已过期”这类按时间推导的状态能跟上
+        // 空闲时低频刷新，让“已过期”这类按时间推导的状态能跟上；
+        // 且只在状态签名真正变化时才重绘，静置时几乎不产生绘制
         static ULONGLONG lastIdleRefresh = 0;
         ULONGLONG nowTick = GetTickCount64();
-        if (nowTick - lastIdleRefresh >= 2000)
+        if (nowTick - lastIdleRefresh >= 3000)
         {
             lastIdleRefresh = nowTick;
-            UpdateNodePanel();
-            InvalidateRect(hExamList, NULL, TRUE);
+            RefreshDerivedStatesIfChanged();
         }
 
         // 试听兜底：播放器卡死时最多留 10 分钟，别一直占着音频设备
@@ -2995,7 +3046,14 @@ static void OnTick()
         }
     }
 
-    UpdateCountdown();
+    // 倒计时只用秒级分辨率，200 ms 轮询时不必每秒重建 5 次
+    static __int64 lastCountSecond = -1;
+    __int64 countSec = now / 10000000LL;
+    if (countSec != lastCountSecond)
+    {
+        lastCountSecond = countSec;
+        UpdateCountdown();
+    }
     CheckAllFinished();
     ApplyTimerMode();
 }

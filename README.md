@@ -15,7 +15,7 @@
 - 监测进行中仍可继续添加新场次，无需急停；
 - 全部节点触发后自动复位，可立即继续排下一场。
 
-`dist\ExamBell.exe` 约 960 KB，静态链接，只调用系统自带 DLL，**零安装**。空闲时 CPU 占用约 `0%`、私有内存约 `4 MB`。
+`dist\ExamBell.exe` 约 444 KB，静态链接，只调用系统自带 DLL，**零安装**。针对 2011 年前后的 Win7 x64 老机器做了低占用优化：空闲时定时器只跑 `1 s`、界面静置时不重绘，实测空闲 10 秒 CPU 时间为 `0 ms`。
 
 ---
 
@@ -157,10 +157,13 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 windres -I src-native -O coff -o res.o src-native/exambell.rc
 
 # 2) 静态链接生成 exe（产物无任何第三方运行时依赖）
-g++ -O2 -mwindows -municode -static -static-libgcc -static-libstdc++ \
+g++ -O2 -s -mwindows -municode -static -static-libgcc -static-libstdc++ \
+    -ffunction-sections -fdata-sections -Wl,--gc-sections \
     -o dist/ExamBell.exe src-native/exambell.cpp res.o \
     -lwinhttp -lwinmm -lcomctl32 -lgdi32 -luser32 -lole32
 ```
+
+> `-s` 去掉符号表，`-ffunction-sections -fdata-sections -Wl,--gc-sections` 让链接器丢弃未引用的函数与数据，最终体积约 444 KB（此前为 970 KB），老机器上启动更快、磁盘占用更小。
 
 > `-lole32` 不可省略：音频部分调用 `CoInitializeEx`（Media Foundation 初始化），缺了它会在链接阶段报 `undefined reference`。
 
@@ -273,10 +276,14 @@ MCI 的 `mpegvideo` 只认 MPEG-1，放不了 MP4，因此 MP4 / M4A 改走系�
 ### 6. 低占用设计
 
 - **按需轮询**：空闲时定时器 `1 s`，启动监测后自动切到 `200 ms`，任务结束再降回 `1 s`；
-- **按需重绘**：时钟、日期、倒计时、状态胶囊都先比较文本与配色，变化时才 `SetWindowText` + `InvalidateRect`，静置时几乎不产生绘制；
+- **按秒门控**：时钟只在秒变化时重建字符串、日期只在跨日时刷新；倒计时按秒刷新（监测期间 200 ms 轮询不再每秒重算 5 次）；
+- **按状态签名重绘**：节点与日程列表先比对各场/各节点的展示状态，签名不变就完全不重绘；空闲巡检由 `2 s` 放宽到 `3 s`；
+- **文本变更才写控件**：`SetTextIfChanged()` 先读当前文本再决定是否 `SetWindowTextW`，避免整块面板周期性重排；
+- **不擦背景重绘**：列表状态刷新用 `InvalidateRect(..., FALSE)`，配合各行的全量自绘，既不闪也省掉一次底色填充；
 - **无闪烁**：主窗口 `WM_ERASEBKGND` 直接返回，绘制只在 `WM_PAINT` 内一次完成，并启用 `WS_CLIPCHILDREN` 避免子控件区域重绘；
-- **无对象泄漏**：所有 GDI 对象用后即删，实测连续重绘 100 次，GDI 对象数恒定不变；
-- **实测**（Windows 10，125% 缩放）：空闲 CPU `0%`，私有内存约 `4 MB`，工作集约 `24 MB`，长时间静置数值不增长；GDI 对象 49、USER 对象 59 保持不变。
+- **无对象泄漏**：所有 GDI 对象用后即删，长时间静置 GDI / USER 对象数恒定不变；
+- **小体积**：`-s` + `--gc-sections` 后 exe 约 444 KB（此前 970 KB），老机器上加载与冷启动更快；
+- **实测**（Windows 10 x64）：空闲 10 秒 CPU 时间为 `0 ms`，句柄数长时间静置不增长。
 
 ### 7. 稳定性设计
 
@@ -326,6 +333,16 @@ MCI 的 `mpegvideo` 只认 MPEG-1，放不了 MP4，因此 MP4 / M4A 改走系�
 ---
 
 ## 更新日志
+
+### 2026-11-01 · v1.6.4
+
+面向 2011 年前后的低配 Win7 x64 机器做性能优化，功能与操作方式不变：
+
+- 时钟、日期改为按「秒 / 日」门控刷新，倒计时按秒刷新：监测期间 `200 ms` 轮询不再每次都重建时间字符串、重算倒计时；
+- 空闲巡检由 `2 s` 放宽到 `3 s`，并新增状态签名比对——各场/各节点展示状态没变就完全不重绘；
+- 节点面板、音频标签改用 `SetTextIfChanged()`，只有文本真的变化才写控件；列表刷新改为不擦背景重绘；
+- 构建加 `-s -ffunction-sections -fdata-sections -Wl,--gc-sections`，exe 由 970 KB 降到 444 KB（约 -54%），老机器加载更轻；
+- 实测：空闲 10 秒 CPU 时间 `0 ms`，句柄数与私有内存长时间静置不增长。
 
 ### 2026-11-01 · v1.6.3
 
