@@ -183,6 +183,26 @@ static int  g_playKind = -1;
 // 待启动（校时完成后才真正开始）
 static bool g_pendingStart = false;
 
+// 本轮自然结束（非急停）后保留“已完成”状态，直到重新启动或日程被修改
+static bool g_completed = false;
+
+// 试听开始时刻：仅用于兜底停止卡死的试听播放
+static ULONGLONG g_previewTick = 0;
+
+// 同一时刻可能有多个节点到点（多场考试同时开始，或上一段还没播完）。
+// 早期实现会直接打断上一段，导致播报被截断；这里改为排队，逐段放完。
+struct BellItem { int exam; int kind; };
+
+static std::vector<BellItem> g_bellQueue;
+
+// 正在播放的节点是否仍处于“播放中”：下标全部校验，避免 nodeState[-1] 越界
+static bool BellNodeStillPlaying()
+{
+    return g_playExam >= 0 && g_playExam < g_examCount &&
+           g_playKind >= 0 && g_playKind < NODE_COUNT &&
+           g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY;
+}
+
 // MCI
 static bool g_mciOpen = false;
 
@@ -254,8 +274,11 @@ static SYSTEMTIME FtToSystemTime(__int64 ticks)
 
 static __int64 SystemTimeToFt(const SYSTEMTIME& st)
 {
+    // 非法日期（如 2-31）会让转换失败，此时绝不能返回未初始化的 FILETIME
     FILETIME ft;
-    SystemTimeToFileTime(&st, &ft);
+    ZeroMemory(&ft, sizeof(ft));
+    if (!SystemTimeToFileTime(&st, &ft)) return 0;
+
     LARGE_INTEGER li;
     li.LowPart = ft.dwLowDateTime;
     li.HighPart = ft.dwHighDateTime;
@@ -323,6 +346,8 @@ static bool FileExists(const std::wstring& path)
 
 static void Log(const std::wstring& message);
 static void SyncGapUi();
+static void StartMonitoring();
+static int DaysInMonth(int year, int month);
 
 // ---------------------------------------------------------------------------
 // 运行日志落盘（%APPDATA%\ExamBell\exam_bell.log）
@@ -330,13 +355,21 @@ static void SyncGapUi();
 // ---------------------------------------------------------------------------
 static std::wstring AppDir()
 {
-    wchar_t dir[MAX_PATH] = L"C:\\";
-    if (GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH) == 0)
+    wchar_t dir[MAX_PATH] = {0};
+    if (GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH) == 0 || dir[0] == 0)
     {
-        lstrcpyW(dir, L"C:\\Temp");
+        // 没有 APPDATA 的精简环境：退回临时目录。父目录必须真实存在，
+        // 否则 CreateDirectory 失败后配置与日志都会静默写不进去。
+        if (GetTempPathW(MAX_PATH, dir) == 0 || dir[0] == 0) lstrcpyW(dir, L"C:\\Temp\\");
     }
 
-    std::wstring folder = std::wstring(dir) + L"\\ExamBell";
+    std::wstring base = dir;
+    while (!base.empty() && (base[base.size() - 1] == L'\\' || base[base.size() - 1] == L'/'))
+    {
+        base.erase(base.size() - 1);
+    }
+
+    std::wstring folder = base + L"\\ExamBell";
     CreateDirectoryW(folder.c_str(), NULL);
     return folder;
 }
@@ -365,13 +398,9 @@ static void AppendLogFile(const std::wstring& line)
 {
     RotateLogIfNeeded();
 
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t stamp[64];
-    swprintf(stamp, 64, L"%04d-%02d-%02d %02d:%02d:%02d  ",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-    std::wstring text = std::wstring(stamp) + line + L"\r\n";
+    // 统一用北京时间打时间戳：打铃以北京时间为准，日志跟随同一时基，
+    // 机器时区不是 UTC+8 时时间线也不会和界面时钟对不上
+    std::wstring text = FormatDateTime(FtNow()) + L"  " + line + L"\r\n";
 
     int need = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), NULL, 0, NULL, NULL);
     if (need <= 0) return;
@@ -547,6 +576,14 @@ static int AddExam(const std::wstring& name, __int64 startFt)
         g_exam[i] = g_exam[i - 1];
     }
 
+    // 播放/队列里的场次只记了下标，插入会让 >= pos 的场次整体后移一位。
+    // 不同步平移就会把结束状态记到相邻场次上，并让真正在响的那场永远停在“播放中”。
+    if (g_playExam >= pos) g_playExam++;
+    for (size_t i = 0; i < g_bellQueue.size(); i++)
+    {
+        if (g_bellQueue[i].exam >= pos) g_bellQueue[i].exam++;
+    }
+
     Exam& e = g_exam[pos];
     e.name = name;
     e.startFt = startFt;
@@ -579,7 +616,8 @@ static bool ParseDateTimeText(const std::wstring& raw, __int64* outFt)
     if (swscanf(raw.c_str(), L"%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) hasSeconds = true;
     else if (swscanf(raw.c_str(), L"%d-%d-%d %d:%d", &y, &mo, &d, &h, &mi) != 5) return false;
 
-    if (y < 1970 || y > 2200 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+    if (y < 1970 || y > 2200 || mo < 1 || mo > 12) return false;
+    if (d < 1 || d > DaysInMonth(y, mo)) return false;   // 2-31、4-31 这类不存在的日期直接拒绝
     if (h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) return false;
     if (!hasSeconds) s = 0;
 
@@ -593,6 +631,7 @@ static bool ParseDateTimeText(const std::wstring& raw, __int64* outFt)
     st.wSecond = (WORD)s;
 
     *outFt = SystemTimeToFt(st);
+    if (*outFt <= 0) return false;   // 转换失败时不再把未初始化的值当成时间
     return true;
 }
 
@@ -714,6 +753,7 @@ static void LoadSettings()
     {
         // 首次运行：自动排一场，省去用户先添加的步骤
         AddExam(L"第 1 场", FtFromNowMinutes(30));
+        SaveSettings();   // 立即落盘，否则强杀/断电后下次启动会重排一场新的
     }
 
     g_selectedExam = (g_examCount > 0) ? 0 : -1;
@@ -999,7 +1039,8 @@ static bool ParseSuningTime(const std::string& body, __int64* serverFt)
     if (sscanf(body.substr(pos, end - pos).c_str(), "%d-%d-%d %d:%d:%d",
                &y, &mo, &d, &hh, &mm, &ss) != 6)
         return false;
-    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+    if (y < 1970 || mo < 1 || mo > 12) return false;
+    if (d < 1 || d > DaysInMonth(y, mo)) return false;
 
     // 接口返回的就是北京时间墙上时间，直接作为基准
     SYSTEMTIME st;
@@ -1007,6 +1048,7 @@ static bool ParseSuningTime(const std::string& body, __int64* serverFt)
     st.wYear = (WORD)y; st.wMonth = (WORD)mo; st.wDay = (WORD)d;
     st.wHour = (WORD)hh; st.wMinute = (WORD)mm; st.wSecond = (WORD)ss;
     *serverFt = SystemTimeToFt(st);
+    if (*serverFt <= 0) return false;
     return true;
 }
 
@@ -1073,8 +1115,12 @@ static bool FetchServerTime(const TimeSource& src, __int64* serverFt,
                                     WINHTTP_HEADER_NAME_BY_INDEX, &st, &size,
                                     WINHTTP_NO_HEADER_INDEX) && st.wYear >= 1970)
             {
-                *serverFt = SystemTimeToFt(st) + (__int64)8 * 3600 * 10000000LL;
-                parsed = true;
+                __int64 utcFt = SystemTimeToFt(st);
+                if (utcFt > 0)
+                {
+                    *serverFt = utcFt + (__int64)8 * 3600 * 10000000LL;
+                    parsed = true;
+                }
             }
             after = LocalFtNow();
         }
@@ -1157,12 +1203,18 @@ static SyncResult* DoSyncRequest()
     return result;
 }
 
+static void PostSyncResult(SyncResult* result)
+{
+    // 窗口已销毁时 PostMessage 会失败，对象由本线程自行释放
+    if (!PostMessageW(g_hwnd, WM_SYNC_DONE, 0, (LPARAM)result)) delete result;
+}
+
 static DWORD WINAPI SyncThreadProc(LPVOID)
 {
     SyncResult* first = DoSyncRequest();
     if (first->ok)
     {
-        PostMessageW(g_hwnd, WM_SYNC_DONE, 0, (LPARAM)first);
+        PostSyncResult(first);
         return 0;
     }
 
@@ -1170,7 +1222,7 @@ static DWORD WINAPI SyncThreadProc(LPVOID)
     Sleep(600);
 
     SyncResult* second = DoSyncRequest();
-    PostMessageW(g_hwnd, WM_SYNC_DONE, 0, (LPARAM)second);
+    PostSyncResult(second);
     return 0;
 }
 
@@ -1186,7 +1238,26 @@ static void StartSyncThread()
 
     DWORD tid = 0;
     HANDLE thread = CreateThread(NULL, 0, SyncThreadProc, NULL, 0, &tid);
-    if (thread) CloseHandle(thread);
+    if (thread)
+    {
+        CloseHandle(thread);
+        return;
+    }
+
+    // 线程创建失败时不会有任何 WM_SYNC_DONE 回来，必须自行回滚，
+    // 否则“启动监测”会永久卡在“启动中…”
+    g_syncBusy = false;
+    EnableWindow(hBtnSync, TRUE);
+    g_syncTextColor = C_BADTXT;
+    SetWindowTextW(hSync, L"未同步 · 无法启动校时线程");
+    InvalidateRect(hSync, NULL, TRUE);
+    Log(L"校时线程创建失败，按本机时间继续");
+
+    if (g_pendingStart)
+    {
+        g_pendingStart = false;
+        StartMonitoring();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1520,14 @@ static std::wstring PickFullText()
     return parts[0] + L"-" + parts[1] + L"-" + parts[2] + L"  " + parts[3] + L":" + parts[4];
 }
 
+// 向下取整的除法：负值时 a / b 会向 0 截断，这里统一按“借位”处理
+static int FloorDiv(int a, int b)
+{
+    int q = a / b;
+    if ((a % b) != 0 && a < 0) q--;
+    return q;
+}
+
 static void AdjustPick(int delta)
 {
     int year = (int)g_pick.wYear;
@@ -1459,49 +1538,37 @@ static void AdjustPick(int delta)
 
     switch (g_pickSeg)
     {
-        case 0:
-            year += delta;
-            break;
-        case 1:
-            month += delta;
-            if (month > 12) { month = 1; year++; }
-            else if (month < 1) { month = 12; year--; }
-            break;
-        case 2:
-            day += delta;
-            if (day > DaysInMonth(year, month))
-            {
-                day = 1;
-                month++;
-                if (month > 12) { month = 1; year++; }
-            }
-            else if (day < 1)
-            {
-                month--;
-                if (month < 1) { month = 12; year--; }
-                day = DaysInMonth(year, month);
-            }
-            break;
-        case 3:
-            hour += delta;
-            if (hour > 23) hour = 0;
-            else if (hour < 0) hour = 23;
-            break;
-        case 4:
-            minute += delta;
-            if (minute > 59)
-            {
-                minute = 0;
-                hour++;
-                if (hour > 23) hour = 0;
-            }
-            else if (minute < 0)
-            {
-                minute = 59;
-                hour--;
-                if (hour < 0) hour = 23;
-            }
-            break;
+        case 0: year += delta; break;
+        case 1: month += delta; break;
+        case 2: day += delta; break;
+        case 3: hour += delta; break;
+        case 4: minute += delta; break;
+    }
+
+    // 分钟→小时→日→月 依次进位/借位：
+    // 原来小时 23 +1 会直接回到 0 点而不改日期，场次会从“今天 23:00”变成“今天 00:00”
+    int carry = FloorDiv(minute, 60);
+    minute -= carry * 60;
+    hour += carry;
+
+    carry = FloorDiv(hour, 24);
+    hour -= carry * 24;
+    day += carry;
+
+    while (month > 12) { month -= 12; year++; }
+    while (month < 1) { month += 12; year--; }
+
+    while (day > DaysInMonth(year, month))
+    {
+        day -= DaysInMonth(year, month);
+        month++;
+        if (month > 12) { month = 1; year++; }
+    }
+    while (day < 1)
+    {
+        month--;
+        if (month < 1) { month = 12; year--; }
+        day += DaysInMonth(year, month);
     }
 
     g_pick.wYear = (WORD)year;
@@ -2389,7 +2456,7 @@ static const wchar_t* ExamStatusText(int exam)
         case ST_PEND: return L"待触发";
         case ST_PLAY: return L"播放中";
         case ST_DONE: return L"已完成";
-        case ST_MISS: return L"已过期";
+        case ST_MISS: return L"已错过";
         case ST_CANC: return L"已取消";
     }
     return L"未开始";
@@ -2481,6 +2548,16 @@ static void SetGapEditable(bool on)
     }
 }
 
+// 监测进行中锁定音频设置：试听会 AudioStopAll()，把正在响的铃声当场截断
+static void SetAudioEditEnabled(bool on)
+{
+    for (int i = 0; i < NODE_COUNT; i++)
+    {
+        if (hBtnPick[i]) EnableWindow(hBtnPick[i], on);
+        if (hBtnPlay[i]) EnableWindow(hBtnPlay[i], on);
+    }
+}
+
 // 把 g_gapMin 同步到输入框与节点名称（配置加载后、间隔修改后都走这里）
 static void SyncGapUi()
 {
@@ -2501,6 +2578,9 @@ static void SyncGapUi()
 
 static void RefreshExamList()
 {
+    // 日程内容变了，上一轮的“已完成”标记不再适用
+    g_completed = false;
+
     SendMessageW(hExamList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(hExamList, LB_RESETCONTENT, 0, 0);
 
@@ -2595,6 +2675,13 @@ static void UpdateCountdown()
         text = L"已急停";
         g_runChip = 4;
     }
+    else if (g_completed)
+    {
+        // 自然结束后保留“已完成”，直到重新启动或日程被修改，
+        // 否则会被紧接着的 CheckAllFinished 覆盖成“待启动”，一帧都看不到
+        text = L"本轮已完成";
+        g_runChip = 3;
+    }
     else
     {
         text = L"待启动";
@@ -2680,11 +2767,6 @@ static void ReadGapEdits()
 // ---------------------------------------------------------------------------
 // 打铃调度
 // ---------------------------------------------------------------------------
-// 同一时刻可能有多个节点到点（多场考试同时开始，或上一段还没播完）。
-// 早期实现会直接打断上一段，导致播报被截断；这里改为排队，逐段放完。
-struct BellItem { int exam; int kind; };
-
-static std::vector<BellItem> g_bellQueue;
 static ULONGLONG g_playStartTick = 0;   // 本段开始播放的时刻，用于看门狗
 static bool      g_playVerified  = false;
 
@@ -2779,6 +2861,7 @@ static void CheckAllFinished()
     if (!g_running) return;
 
     g_running = false;
+    g_completed = true;
     SetAwake(false);
     EnableWindow(hBtnStart, TRUE);
     SetWindowTextW(hBtnStart, L"启动监测");
@@ -2787,6 +2870,7 @@ static void CheckAllFinished()
     EnableWindow(hBtnDel, g_examCount > 0);
     EnableWindow(hBtnClear, g_examCount > 0);
     SetGapEditable(true);
+    SetAudioEditEnabled(true);
 
     Log(L"全部场次任务已结束，可继续添加或重新启动");
     UpdateCountdown();
@@ -2819,8 +2903,7 @@ static void OnTick()
 
         if (g_playVerified && !playing)
         {
-            if (g_playExam < g_examCount &&
-                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            if (BellNodeStillPlaying())
             {
                 g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
                 Log(L"播放结束：" + g_exam[g_playExam].name + L" · " + NodeName(g_playKind));
@@ -2833,8 +2916,7 @@ static void OnTick()
         {
             // 一直没进入播放状态，按失败收尾，避免卡住整条队列
             Log(L"音频未能进入播放状态，已跳过");
-            if (g_playExam < g_examCount &&
-                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            if (BellNodeStillPlaying())
             {
                 g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
             }
@@ -2847,8 +2929,7 @@ static void OnTick()
             // 看门狗：一段音频超过 10 分钟仍在“播放”，多半是设备被拔掉 / 驱动卡死
             Log(L"音频播放超时（超过 10 分钟），强制结束并继续后续节点");
             AudioStopAll();
-            if (g_playExam < g_examCount &&
-                g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
+            if (BellNodeStillPlaying())
             {
                 g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
             }
@@ -2871,6 +2952,21 @@ static void OnTick()
             lastIdleRefresh = nowTick;
             UpdateNodePanel();
             InvalidateRect(hExamList, NULL, TRUE);
+        }
+
+        // 试听兜底：播放器卡死时最多留 10 分钟，别一直占着音频设备
+        if (g_previewTick != 0)
+        {
+            if (!AudioIsPlaying())
+            {
+                g_previewTick = 0;
+            }
+            else if (GetTickCount64() - g_previewTick > 10u * 60u * 1000u)
+            {
+                Log(L"试听超时（超过 10 分钟），已强制停止");
+                AudioStopAll();
+                g_previewTick = 0;
+            }
         }
 
         UpdateCountdown();
@@ -2965,6 +3061,8 @@ static void SetAwake(bool on)
 static void StartMonitoring()
 {
     g_stoppedByUser = false;
+    g_completed = false;
+    g_previewTick = 0;
     g_playExam = -1;
     g_playKind = -1;
     g_bellQueue.clear();
@@ -3003,10 +3101,11 @@ static void StartMonitoring()
     SetWindowTextW(hBtnStart, L"监测中");
     InvalidateRect(hBtnStart, NULL, TRUE);
 
-    // 运行中仍可继续排入新场次，只锁定删除类操作与间隔设置
+    // 运行中仍可继续排入新场次，只锁定删除类操作、间隔与音频设置
     EnableWindow(hBtnDel, FALSE);
     EnableWindow(hBtnClear, FALSE);
     SetGapEditable(false);
+    SetAudioEditEnabled(false);
 
     wchar_t buf[64];
     swprintf(buf, 64, L"开始监测 · 共 %d 场，%d 个节点待触发", g_examCount, activeNodes);
@@ -3022,6 +3121,19 @@ static void PerformEmergencyStop()
 {
     if (!g_running)
     {
+        // 校时还没结束时按急停：取消这次待启动，别在几秒后自己又开始监测
+        if (g_pendingStart)
+        {
+            g_pendingStart = false;
+            EnableWindow(hBtnStart, TRUE);
+            SetWindowTextW(hBtnStart, L"启动监测");
+            InvalidateRect(hBtnStart, NULL, TRUE);
+            Log(L"【急停】已取消本次启动（校时尚未完成）");
+            UpdateCountdown();
+            ApplyTimerMode();
+            return;
+        }
+
         Log(L"急停：当前没有正在进行的监测任务");
         return;
     }
@@ -3032,6 +3144,8 @@ static void PerformEmergencyStop()
     g_playKind = -1;
     g_bellQueue.clear();
     g_playVerified = false;
+    g_previewTick = 0;
+    g_completed = false;
 
     for (int i = 0; i < g_examCount; i++)
     {
@@ -3054,6 +3168,7 @@ static void PerformEmergencyStop()
     EnableWindow(hBtnDel, g_examCount > 0);
     EnableWindow(hBtnClear, g_examCount > 0);
     SetGapEditable(true);
+    SetAudioEditEnabled(true);
 
     Log(L"【急停】已停止播放并取消全部后续任务");
 
@@ -3199,8 +3314,10 @@ static void ClearExams()
 
     g_examCount = 0;
     g_selectedExam = -1;
+    g_stoppedByUser = false;   // 日程清空后不再保留“已急停”状态
     RefreshExamList();
     SaveSettings();
+    UpdateCountdown();
     Log(L"已清空全部场次");
 }
 
@@ -3209,6 +3326,12 @@ static void ClearExams()
 // ---------------------------------------------------------------------------
 static void ChooseAudio(int index)
 {
+    if (g_running || g_pendingStart)
+    {
+        Log(L"监测进行中，暂不能更换音频文件");
+        return;
+    }
+
     wchar_t file[MAX_PATH] = {0};
 
     OPENFILENAMEW ofn;
@@ -3229,12 +3352,22 @@ static void ChooseAudio(int index)
     UpdateAudioLabel(index);
     SaveSettings();
 
-    static const wchar_t* caps[3] = { L"考前 10 分钟", L"考前 5 分钟", L"考试开始" };
-    Log(L"已设置音频（" + std::wstring(caps[index]) + L"）：" + FileNameOf(file));
+    Log(L"已设置音频（" + NodeShortName(index) + L"）：" + FileNameOf(file));
 }
 
 static void PreviewAudio(int index)
 {
+    // 试听会 AudioStopAll()：监测期间试听会把正在播的铃声当场掐断，
+    // 还会被记成“已完成”，事后追查会误判铃声正常播完
+    if (g_running || g_pendingStart)
+    {
+        MessageBoxW(g_hwnd,
+                    L"监测进行中不能试听，以免打断正在播放的考试铃声。\r\n"
+                    L"请先急停或等本轮结束后再试听。",
+                    L"正在打铃", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
     if (g_audio[index].empty())
     {
         MessageBoxW(g_hwnd, L"请先为该段选择音频文件。", L"未设置音频",
@@ -3249,15 +3382,6 @@ static void PreviewAudio(int index)
         return;
     }
 
-    if (g_playExam >= 0 && g_playExam < g_examCount &&
-        g_exam[g_playExam].nodeState[g_playKind] == ST_PLAY)
-    {
-        g_exam[g_playExam].nodeState[g_playKind] = ST_DONE;
-        g_playExam = -1;
-        g_playKind = -1;
-        UpdateAllNodeRows();
-    }
-
     if (!AudioPlay(g_audio[index]))
     {
         MessageBoxW(g_hwnd,
@@ -3267,6 +3391,7 @@ static void PreviewAudio(int index)
         return;
     }
 
+    g_previewTick = GetTickCount64();   // 纳入空闲轮询的兜底停止
     Log(L"试听：" + FileNameOf(g_audio[index]));
 }
 
@@ -3714,6 +3839,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SetBkMode(dc, OPAQUE);
         SetBkColor(dc, C_SURFACE);
 
+        // 只读 EDIT 收到的是 WM_CTLCOLORSTATIC（不是 WM_CTLCOLOREDIT），
+        // 日志区的浅灰底必须在这里处理，否则永远是最底层消息里的纯白底
+        if (control == hLog)
+        {
+            SetBkColor(dc, RGB(250, 251, 252));
+            SetTextColor(dc, C_INK);
+            return (LRESULT)bLog;
+        }
+
         if (control == hSync) SetTextColor(dc, g_syncTextColor);
         else if (control == hSubtitle || control == hDate || control == hSetHint ||
                  control == hExamCount || control == hFootHint ||
@@ -3728,15 +3862,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CTLCOLOREDIT:
     {
         HDC dc = (HDC)wParam;
-        HWND control = (HWND)lParam;
 
         SetBkMode(dc, OPAQUE);
         SetTextColor(dc, C_INK);
-
-        // 日志区用更浅的底色，与正文区区分
-        bool isLog = (control == hLog);
-        SetBkColor(dc, isLog ? RGB(250, 251, 252) : C_SURFACE);
-        return (LRESULT)(isLog ? bLog : bEdit);
+        SetBkColor(dc, C_SURFACE);
+        return (LRESULT)bEdit;
     }
 
     case WM_CTLCOLORLISTBOX:
@@ -3949,6 +4079,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         FlashWindow(hwnd, TRUE);
         SetForegroundWindow(hwnd);
         return 0;
+
+    case WM_QUERYENDSESSION:
+        // 关机 / 注销不会走 WM_CLOSE，必须在这里自己落盘，
+        // 否则学校统一关机时当天排好的日程会丢
+        SaveSettings();
+        Log(L"系统即将关机或注销，已保存日程");
+        return TRUE;
 
     case WM_CLOSE:
         if (g_running)

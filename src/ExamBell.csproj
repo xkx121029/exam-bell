@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
+  <!-- 早期 .NET 实现（已弃用，仅作历史保留）。构建产物与本仓库正式版无关，
+       请勿用于考试现场；正式版为 src-native 下的 Win32 原生程序。 -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net45</TargetFramework>
     <LangVersion>7.3</LangVersion>
-    <AssemblyName>ExamBell</AssemblyName>
+    <AssemblyName>ExamBell-Legacy</AssemblyName>
     <RootNamespace>ExamBell</RootNamespace>
-    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationIcon>../app.ico</ApplicationIcon>
     <Version>1.0.0.0</Version>
-    <AssemblyTitle>考试自动打铃</AssemblyTitle>
+    <AssemblyTitle>考试自动打铃（早期版本）</AssemblyTitle>
     <Product>考试自动打铃</Product>
     <Deterministic>true</Deterministic>
     <DebugType>none</DebugType>
